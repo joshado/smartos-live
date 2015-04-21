@@ -39,6 +39,22 @@ var verror = require('verror');
 
 
 var DIRECTIONS = ['to', 'from'];
+// Exported fields that can be in the serialized rule:
+var FIELDS = [
+    'created_by',
+    'description',
+    'enabled',
+    'global',
+    'owner_uuid',
+    'rule',
+    'uuid',
+    'version'
+];
+// Maximum number of targets per side:
+var MAX_TARGETS_PER_SIDE = 24;
+// Maximum number of ports:
+var MAX_PORTS = 8;
+var STRING_PROPS = ['created_by', 'description'];
 var TARGET_TYPES = ['wildcard', 'ip', 'subnet', 'tag', 'vm'];
 
 
@@ -144,15 +160,19 @@ function quote(str) {
 /**
  * Firewall rule constructor
  */
-function FwRule(data) {
+function FwRule(data, opts) {
     var errs = [];
     var parsed;
+
+    if (!opts) {
+        opts = {};
+    }
 
     // -- validation --
 
     if (!data.rule && !data.parsed) {
         errs.push(new validators.InvalidParamError('rule',
-            'No rule specified!'));
+            'No rule specified'));
     } else {
         try {
             parsed = data.parsed || parser.parse(data.rule);
@@ -164,7 +184,7 @@ function FwRule(data) {
     if (data.hasOwnProperty('uuid')) {
         if (!validators.validateUUID(data.uuid)) {
             errs.push(new validators.InvalidParamError('uuid',
-                        'Invalid rule UUID "%s"', data.uuid));
+                'Invalid rule UUID'));
         }
 
         this.uuid = data.uuid;
@@ -177,14 +197,16 @@ function FwRule(data) {
     if (data.hasOwnProperty('owner_uuid')) {
         if (!validators.validateUUID(data.owner_uuid)) {
             errs.push(new validators.InvalidParamError('owner_uuid',
-                'Invalid owner UUID "%s"', data.owner_uuid));
+                'Invalid owner UUID'));
         }
         this.owner_uuid = data.owner_uuid;
+    } else {
+        // No owner: this rule will affect all VMs
+        this.global = true;
     }
 
     if (data.hasOwnProperty('enabled')) {
-        if (typeof (data.enabled) !== 'boolean' && data.enabled !== 'true'
-            && data.enabled !== 'false') {
+        if (!validators.bool(data.enabled)) {
             errs.push(new validators.InvalidParamError('enabled',
                 'enabled must be true or false'));
         }
@@ -192,6 +214,37 @@ function FwRule(data) {
         this.enabled = data.enabled;
     } else {
         this.enabled = false;
+    }
+
+    for (var s in STRING_PROPS) {
+        var str = STRING_PROPS[s];
+        if (data.hasOwnProperty(str)) {
+            try {
+                validators.validateString(str, data[str]);
+                this[str] = data[str];
+            } catch (valErr) {
+                errs.push(valErr);
+            }
+        }
+    }
+
+    if (opts.enforceGlobal) {
+        if (data.hasOwnProperty('global') && !validators.bool(data.global)) {
+            errs.push(new validators.InvalidParamError('global',
+                'global must be true or false'));
+        }
+
+        if (data.hasOwnProperty('global')
+            && data.hasOwnProperty('owner_uuid') && data.global) {
+            errs.push(new validators.InvalidParamError('global',
+                'cannot specify both global and owner_uuid'));
+        }
+
+        if (!data.hasOwnProperty('global')
+            && !data.hasOwnProperty('owner_uuid')) {
+            errs.push(new validators.InvalidParamError('owner_uuid',
+                'owner_uuid required'));
+        }
     }
 
     if (errs.length !== 0) {
@@ -220,6 +273,13 @@ function FwRule(data) {
         this.protoTargets = this.ports;
     }
 
+    if (this.protoTargets.length > MAX_PORTS) {
+        throw new validators.InvalidParamError('rule',
+            'maximum of %d %s allowed',
+            MAX_TARGETS_PER_SIDE,
+            this.protocol == 'icmp' ? 'types' : 'ports');
+    }
+
     this.from = {};
     this.to = {};
 
@@ -234,13 +294,17 @@ function FwRule(data) {
         'to': {},
         'from': {}
     };
+    var numTargets;
 
     for (d in DIRECTIONS) {
         dir = DIRECTIONS[d];
+        numTargets = 0;
         for (var j in parsed[dir]) {
             var target = parsed[dir][j];
             var targetName;
             var name = target[0] + 's';
+
+            numTargets++;
             if (!dirs[dir].hasOwnProperty(name)) {
                 dirs[dir][name] = {};
             }
@@ -262,6 +326,12 @@ function FwRule(data) {
                 this[name][targetName] = target[1];
                 dirs[dir][name][targetName] = target[1];
             }
+        }
+
+        if (numTargets > MAX_TARGETS_PER_SIDE) {
+            throw new validators.InvalidParamError('rule',
+                'maximum of %d targets allowed per side',
+                MAX_TARGETS_PER_SIDE);
         }
     }
 
@@ -292,6 +362,13 @@ function FwRule(data) {
     if (this.wildcards.length !== 0 && this.wildcards.indexOf('vmall') !== -1) {
         this.allVMs = true;
     }
+
+    // Final check: does this rule actually contain targets that can actually
+    // affect VMs?
+    if (!this.allVMs && this.tags.length === 0 && this.vms.length === 0) {
+        throw new validators.InvalidParamError('rule',
+            'rule does not affect VMs');
+    }
 }
 
 
@@ -300,13 +377,13 @@ function FwRule(data) {
  */
 FwRule.prototype.raw = function () {
     var raw = {
-        'action': this.action,
-        'enabled': this.enabled,
-        'from': this.from,
-        'protocol': this.protocol,
-        'to': this.to,
-        'uuid': this.uuid,
-        'version': this.version
+        action: this.action,
+        enabled: this.enabled,
+        from: this.from,
+        protocol: this.protocol,
+        to: this.to,
+        uuid: this.uuid,
+        version: this.version
     };
 
     if (this.owner_uuid) {
@@ -319,23 +396,42 @@ FwRule.prototype.raw = function () {
         raw.ports = this.ports;
     }
 
+    for (var s in STRING_PROPS) {
+        var str = STRING_PROPS[s];
+        if (this.hasOwnProperty(str)) {
+            raw[str] = this[str];
+        }
+    }
+
     return raw;
 };
 
 
 /**
  * Returns the serialized version of the rule, suitable for storing
+ *
+ * @param fields {Array}: fields to return (optional)
  */
-FwRule.prototype.serialize = function () {
-    var ser = {
-        enabled: this.enabled,
-        rule: this.text(),
-        uuid: this.uuid,
-        version: this.version
-    };
+FwRule.prototype.serialize = function (fields) {
+    var ser = {};
+    if (!fields) {
+        fields = FIELDS;
+    }
 
-    if (this.owner_uuid) {
-        ser.owner_uuid = this.owner_uuid;
+    for (var f in fields) {
+        var field = fields[f];
+        if (field === 'rule') {
+            ser.rule = this.text();
+        } else if (field === 'global') {
+            // Only display the global flag if true
+            if (this.global) {
+                ser.global = true;
+            }
+        } else {
+            if (this.hasOwnProperty(field)) {
+                ser[field] = this[field];
+            }
+        }
     }
 
     return ser;
@@ -421,8 +517,8 @@ FwRule.prototype.toString = function () {
 /**
  * Creates a new firewall rule from the payload
  */
-function createRule(payload) {
-    return new FwRule(payload);
+function createRule(payload, opts) {
+    return new FwRule(payload, opts);
 }
 
 
@@ -434,6 +530,7 @@ module.exports = {
     create: createRule,
     generateVersion: generateVersion,
     DIRECTIONS: DIRECTIONS,
+    FIELDS: FIELDS,
     FwRule: FwRule,
     TARGET_TYPES: TARGET_TYPES
 };

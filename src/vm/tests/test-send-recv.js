@@ -1,12 +1,14 @@
-// Copyright 2012 Joyent, Inc.  All rights reserved.
+// Copyright 2014 Joyent, Inc.  All rights reserved.
 
-process.env['TAP'] = 1;
 var async = require('/usr/node/node_modules/async');
 var cp = require('child_process');
 var execFile = cp.execFile;
-var test = require('tap').test;
 var VM = require('/usr/vm/node_modules/VM');
 var vmtest = require('../common/vmtest.js');
+
+// this puts test stuff in global, so we need to tell jsl about that:
+/* jsl:import ../node_modules/nodeunit-plus/index.js */
+require('nodeunit-plus');
 
 VM.loglevel = 'DEBUG';
 
@@ -17,40 +19,36 @@ var kvm_image_uuid = vmtest.CURRENT_UBUNTU_UUID;
 var vmobj;
 
 var kvm_payload = {
-    'brand': 'kvm',
-    'autoboot': false,
-    'alias': 'test-send-recv-' + process.pid,
-    'do_not_inventory': true,
-    'ram': 256,
-    'max_swap': 1024,
-    'disk_driver': 'virtio',
-    'nic_driver': 'virtio',
-    'disks': [
-        {'boot': true, 'image_uuid': kvm_image_uuid},
-        {'size': 1024}
+    brand: 'kvm',
+    autoboot: false,
+    alias: 'test-send-recv-' + process.pid,
+    do_not_inventory: true,
+    ram: 256,
+    max_swap: 1024,
+    disk_driver: 'virtio',
+    nic_driver: 'virtio',
+    disks: [
+        {boot: true, image_uuid: kvm_image_uuid},
+        {size: 1024}
     ],
-    'customer_metadata': {'hello': 'world'}
+    customer_metadata: {hello: 'world'}
 };
 
 var smartos_payload = {
-    'brand': 'joyent-minimal',
-    'image_uuid': image_uuid,
-    'alias': 'test-send-recv-' + process.pid,
-    'do_not_inventory': true,
-    'ram': 256,
-    'max_swap': 1024,
-    'customer_metadata': {'hello': 'world'}
+    brand: 'joyent-minimal',
+    image_uuid: image_uuid,
+    alias: 'test-send-recv-' + process.pid,
+    do_not_inventory: true,
+    ram: 256,
+    max_swap: 1024,
+    customer_metadata: {hello: 'world'}
 };
-
-
-// This will ensure vmtest.CURRENT_* are installed
-vmtest.ensureCurrentImages();
 
 [['zone', smartos_payload], ['kvm', kvm_payload]].forEach(function (d) {
     var thing_name = d[0];
     var thing_payload = d[1];
 
-    test('create ' + thing_name, {'timeout': 240000}, function(t) {
+    test('create ' + thing_name, function(t) {
         VM.create(thing_payload, function (err, obj) {
             if (err) {
                 t.ok(false, 'error creating VM: ' + err.message);
@@ -78,7 +76,7 @@ vmtest.ensureCurrentImages();
         });
     });
 
-    test('send ' + thing_name, {'timeout': 360000}, function(t) {
+    test('send ' + thing_name, function(t) {
         if (abort) {
             t.ok(false, 'skipping send as test run is aborted.');
             t.end();
@@ -107,7 +105,7 @@ vmtest.ensureCurrentImages();
         );
     });
 
-    test('delete ' + thing_name, function(t) {
+    test('delete after sending ' + thing_name, function(t) {
         if (abort) {
             t.ok(false, 'skipping send as test run is aborted.');
             t.end();
@@ -130,7 +128,7 @@ vmtest.ensureCurrentImages();
         }
     });
 
-    test('receive ' + thing_name, {'timeout': 360000}, function(t) {
+    test('receive ' + thing_name, function(t) {
         if (abort) {
             t.ok(false, 'skipping send as test run is aborted.');
             t.end();
@@ -181,7 +179,7 @@ vmtest.ensureCurrentImages();
                                     t.ok(true, 'Zone went to state: ' + obj.state);
 
                                     for (prop in vmobj) {
-                                        if (['last_modified', 'zoneid'].indexOf(prop) !== -1) {
+                                        if (['boot_timestamp', 'last_modified', 'pid', 'zoneid'].indexOf(prop) !== -1) {
                                             // we expect these properties to be different.
                                             continue;
                                         }
@@ -213,7 +211,7 @@ vmtest.ensureCurrentImages();
         );
     });
 
-    test('delete ' + thing_name, function(t) {
+    test('delete after receiving ' + thing_name, function(t) {
         if (abort) {
             t.ok(false, 'skipping send as test run is aborted.');
             t.end();

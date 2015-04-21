@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2013, Joyent, Inc. All rights reserved.
  *
- * mocks for tests
+ * Unit test helper functions
  */
 
 var assert = require('assert-plus');
@@ -11,8 +11,10 @@ var mod_obj = require('../../lib/util/obj');
 var mocks = require('./mocks');
 var mod_uuid = require('node-uuid');
 var util = require('util');
+var util_vm = require('../../lib/util/vm');
 
 var createSubObjects = mod_obj.createSubObjects;
+
 
 
 // --- Globals
@@ -22,6 +24,7 @@ var createSubObjects = mod_obj.createSubObjects;
 var DEBUG_FILES = process.env.PRINT_IPF_CONFS;
 var IP_NUM = 2;
 var SYN_LINE = 'pass out quick proto tcp from any to any flags S/SA keep state';
+
 
 
 // --- Internal functions
@@ -45,6 +48,39 @@ function endsWith(str, suffix)
 
 // --- Exports
 
+
+
+/**
+ * Adds a series of zones rules
+ */
+function addZoneRules(exp, toAdd) {
+    assert.object(exp, 'exp');
+
+    toAdd.forEach(function (r) {
+        // console.log('adding: %s %s %s %s %s %j',
+        //    r[0].uuid, r[1], r[2], r[3], r[4], r[5]);
+
+        var vm = r[0].uuid;
+        if (!exp[vm]) {
+            exp[vm] = defaultZoneRules();
+        }
+
+        if (r[1] === 'default') {
+            return;
+        }
+
+        // [vm, 'in', 'pass', 'tcp', ip, ports]
+        var proto = createSubObjects(exp[vm], r[1], r[2], r[3]);
+        if (!proto.hasOwnProperty(r[4])) {
+            proto[r[4]] = [];
+        }
+
+        var ports = typeof (r[5]) === 'object' ? r[5] : r[5];
+        proto[r[4]] = proto[r[4]].concat(ports).sort(function (a, b) {
+            return Number(a) > Number(b);
+        });
+    });
+}
 
 
 /**
@@ -141,7 +177,7 @@ function fwListEquals(t, rules, callback) {
 
 
 /**
- * Does a fw.rules() for a VM and a deepEqual to confirm the retrieved
+ * Does a fw.vmRules() for a VM and a deepEqual to confirm the retrieved
  * list is the same
  */
 function fwRulesEqual(opts, callback) {
@@ -151,7 +187,7 @@ function fwRulesEqual(opts, callback) {
     assert.object(opts.vm, 'opts.vm');
     assert.arrayOfObject(opts.vms, 'opts.vms');
 
-    mocks.fw.rules({ vm: opts.vm.uuid, vms: opts.vms }, function (err, res) {
+    mocks.fw.vmRules({ vm: opts.vm.uuid, vms: opts.vms }, function (err, res) {
         opts.t.ifError(err);
         if (err) {
             return callback();
@@ -159,7 +195,35 @@ function fwRulesEqual(opts, callback) {
 
         // clone the input rules in case order is important to the caller:
         opts.t.deepEqual(res.sort(uuidSort), clone(opts.rules).sort(uuidSort),
-            'fw.rules() correct for ' + opts.vm.uuid);
+            'fw.vmRules() correct for ' + opts.vm.uuid);
+
+        return callback();
+    });
+}
+
+
+/**
+ * Does a fw.rvmRules() for a VM and a deepEqual to confirm the retrieved
+ * list is the same
+ */
+function fwRvmRulesEqual(opts, callback) {
+    assert.object(opts, 'opts');
+    assert.arrayOfObject(opts.rules, 'opts.rules');
+    assert.object(opts.t, 'opts.t');
+    assert.ok(opts.rvm, 'opts.rvm');
+    assert.arrayOfObject(opts.vms, 'opts.vms');
+
+    mocks.fw.rvmRules({ remoteVM: opts.rvm, vms: opts.vms },
+        function (err, res) {
+        opts.t.ifError(err);
+        if (err) {
+            return callback();
+        }
+
+        // clone the input rules in case order is important to the caller:
+        opts.t.deepEqual(res.sort(uuidSort), clone(opts.rules).sort(uuidSort),
+            'fw.rvmRules() correct for '
+            + typeof (opts.rvm) === 'object' ?  opts.rvm.uuid : opts.rvm);
 
         return callback();
     });
@@ -210,6 +274,31 @@ function testEnableDisable(opts, callback) {
 
             return callback();
         });
+    });
+}
+
+
+/**
+ * Tests that fw.listRVMs() returns only the given set of remote VMs
+ */
+function testRVMlist(opts, callback) {
+    assert.object(opts, 'opts');
+    assert.object(opts.t, 'opts.t');
+    assert.object(opts.rvms, 'opts.rvms');
+
+    var t = opts.t;
+
+    mocks.fw.listRVMs({}, function (err, res) {
+        t.ifError(err);
+        if (err) {
+            return callback(err);
+        }
+
+        t.deepEqual(res, opts.rvms.map(function (rvm) {
+            return util_vm.createRemoteVM(rvm);
+        }).sort(uuidSort), 'listRVMs: result correct');
+
+        return callback();
     });
 }
 
@@ -365,6 +454,16 @@ function generateVM(override) {
 
 
 /**
+ * Prints a VM for debugging
+ */
+function printVM(name, vm) {
+    console.log('%s=%s (%s)', name, vm.uuid, vm.nics.map(function (n) {
+        return n.ip;
+    }).join(', '));
+}
+
+
+/**
  * Gets the remote VM files stored on disk in /var/fw/vms
  */
 function remoteVMsOnDisk(fw) {
@@ -423,6 +522,16 @@ function sortRes(res) {
 
 
 /**
+ * Return the sorted list of each array element's .uuid property
+ */
+function sortedUUIDs(arr) {
+    return arr.map(function (el) {
+        return el.uuid;
+    }).sort();
+}
+
+
+/**
  * Sort by rule UUID
  */
 function uuidSort(a, b) {
@@ -430,21 +539,45 @@ function uuidSort(a, b) {
 }
 
 
+/**
+ * Test that fw.vms() returns the correct VMs affected
+ */
+function vmsAffected(opts, callback) {
+    mocks.fw.vms({ rule: opts.rule, vms: opts.allVMs }, function (err, res) {
+        opts.t.ifError(err, 'vmsAffected error');
+        if (err) {
+            return callback();
+        }
+
+        opts.t.deepEqual(res.sort(), opts.vms.map(function (vm) {
+            return vm.uuid;
+        }).sort(), opts.vms.length + ' vms affected');
+        return callback();
+    });
+}
+
+
 
 module.exports = {
+    addZoneRules: addZoneRules,
     defaultZoneRules: defaultZoneRules,
     fillInRuleBlanks: fillInRuleBlanks,
     findRuleInList: findRuleInList,
     fwGetEquals: fwGetEquals,
     fwListEquals: fwListEquals,
     fwRulesEqual: fwRulesEqual,
+    fwRvmRulesEqual: fwRvmRulesEqual,
     getIPFenabled: getIPFenabled,
     generateVM: generateVM,
+    printVM: printVM,
     remoteVMsOnDisk: remoteVMsOnDisk,
     rulesOnDisk: rulesOnDisk,
     sortRes: sortRes,
+    sortedUUIDs: sortedUUIDs,
     testEnableDisable: testEnableDisable,
+    testRVMlist: testRVMlist,
     uuidNum: uuidNum,
     uuidSort: uuidSort,
+    vmsAffected: vmsAffected,
     zoneIPFconfigs: zoneIPFconfigs
 };

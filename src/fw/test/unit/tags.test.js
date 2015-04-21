@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2013, Joyent, Inc. All rights reserved.
  *
- * fwadm tests: tags
+ * fwadm test: tags
  */
 
 var async = require('async');
@@ -26,6 +26,7 @@ var mergeObjects = mod_obj.mergeObjects;
 // Set this to any of the exports in this file to only run that test,
 // plus setup and teardown
 var runOne;
+var d = {};
 
 
 
@@ -40,13 +41,13 @@ exports['setup'] = function (t) {
 };
 
 
-// run before every test
-exports.setUp = function (cb) {
+// Should be run before every test
+function reset() {
     if (fw) {
         mocks.reset();
     }
-    cb();
-};
+    d = {};
+}
 
 
 
@@ -56,6 +57,7 @@ exports.setUp = function (cb) {
 
 // XXX: split this into separate tests rather than using async
 exports['add / update: tag to tag'] = function (t) {
+    reset();
     var expRules;
     var expRulesOnDisk = {};
     var vmsEnabled;
@@ -127,6 +129,7 @@ exports['add / update: tag to tag'] = function (t) {
         rules: [
             {
                 rule: 'FROM tag one TO tag one ALLOW tcp PORT 80',
+                owner_uuid: vm1.owner_uuid,
                 enabled: true
             }
         ],
@@ -349,6 +352,7 @@ exports['add / update: tag to tag'] = function (t) {
             }
 
             t.deepEqual(helpers.sortRes(res), {
+                remoteVMs: [vm9.uuid],
                 rules: [],
                 vms: tagOneVMs.map(function (vm) { return vm.uuid; }).sort()
             }, 'result returned');
@@ -423,6 +427,7 @@ exports['add / update: tag to tag'] = function (t) {
             }
 
             t.deepEqual(helpers.sortRes(res), {
+                remoteVMs: [vm10.uuid],
                 rules: [],
                 vms: []
             }, 'result returned');
@@ -456,6 +461,7 @@ exports['add / update: tag to tag'] = function (t) {
             }
 
             t.deepEqual(helpers.sortRes(res), {
+                remoteVMs: [vm10.uuid],
                 rules: [],
                 vms: tagOneVMs.map(function (vm) { return vm.uuid; }).sort()
             }, 'result returned');
@@ -491,6 +497,7 @@ exports['add / update: tag to tag'] = function (t) {
             }
 
             t.deepEqual(helpers.sortRes(res), {
+                remoteVMs: helpers.sortedUUIDs([vm11, vm12]),
                 rules: [],
                 vms: []
             }, 'result returned');
@@ -514,10 +521,12 @@ exports['add / update: tag to tag'] = function (t) {
         var addPayload = {
             rules: [
                 {
+                    owner_uuid: vm1.owner_uuid,
                     rule: 'FROM tag red TO tag one ALLOW udp PORT 1000',
                     enabled: true
                 },
                 {
+                    owner_uuid: vm1.owner_uuid,
                     rule: 'FROM tag red TO tag one ALLOW udp PORT 1001',
                     enabled: true
                 }
@@ -571,6 +580,7 @@ exports['add / update: tag to tag'] = function (t) {
         var addPayload = {
             rules: [
                 {
+                    owner_uuid: vm1.owner_uuid,
                     rule: 'FROM tag one TO tag red ALLOW tcp PORT 25',
                     enabled: true
                 }
@@ -633,6 +643,10 @@ exports['add / update: tag to tag'] = function (t) {
             if (err) {
                 return cb();
             }
+
+            t.notEqual(res.rules[0].version, rule2.version,
+                'rule version changed');
+            rule2.version = res.rules[0].version;
 
             t.deepEqual(helpers.sortRes(res), {
                 rules: [rule2],
@@ -741,11 +755,13 @@ exports['add / update: tag to tag'] = function (t) {
         var addPayload = {
             rules: [
                 {
+                    owner_uuid: vm1.owner_uuid,
                     rule: util.format(
                         'FROM vm %s TO tag one ALLOW tcp PORT 8080', vm4.uuid),
                     enabled: true
                 },
                 {
+                    owner_uuid: vm1.owner_uuid,
                     rule: util.format(
                         'FROM tag one TO vm %s ALLOW tcp PORT 8080', vm4.uuid),
                     enabled: true
@@ -810,6 +826,7 @@ exports['add / update: tag to tag'] = function (t) {
         var addPayload = {
             rules: [
                 {
+                    owner_uuid: vm1.owner_uuid,
                     rule: 'FROM tag one TO tag two ALLOW tcp PORT 125',
                     enabled: true
                 }
@@ -864,6 +881,7 @@ exports['add / update: tag to tag'] = function (t) {
 
 
 exports['tags with values'] = function (t) {
+    reset();
     var vm1 = helpers.generateVM({ uuid: helpers.uuidNum(1) });
     var vm2 = helpers.generateVM({ uuid: helpers.uuidNum(2),
         tags: { role: 'web' } });
@@ -887,6 +905,7 @@ exports['tags with values'] = function (t) {
         remoteVMs: [rvm1, rvm2, rvm3],
         rules: [
             {
+                owner_uuid: vm1.owner_uuid,
                 rule: 'FROM any TO tag role = web ALLOW tcp PORT 80',
                 enabled: true
             }
@@ -914,6 +933,7 @@ exports['tags with values'] = function (t) {
             expRules[0].version = res.rules[0].version;
 
             t.deepEqual(helpers.sortRes(res), {
+                remoteVMs: helpers.sortedUUIDs([rvm1, rvm2, rvm3]),
                 rules: expRules,
                 vms: [ vm2.uuid, vm4.uuid ].sort()
             }, 'rules returned');
@@ -954,6 +974,7 @@ exports['tags with values'] = function (t) {
         var addPayload = {
             rules: [
                 {
+                    owner_uuid: vm1.owner_uuid,
                     rule: 'FROM tag role = web TO tag role = mon '
                         + 'ALLOW udp PORT 514',
                     enabled: true
@@ -1112,6 +1133,7 @@ exports['tags with values'] = function (t) {
             }
 
             t.deepEqual(helpers.sortRes(res), {
+                remoteVMs: [ rvm4.uuid ],
                 vms: [ vm2.uuid, vm3.uuid, vm4.uuid, vm5.uuid ].sort(),
                 rules: [ ]
             }, 'rules returned');
@@ -1169,7 +1191,191 @@ exports['tags with values'] = function (t) {
     }
 
     ], function () {
-            t.done();
+        t.done();
+    });
+};
+
+
+exports['add a local provisioning VM with a tag'] = {
+    'add rule': function (t) {
+        reset();
+        d.vm = helpers.generateVM({
+            state: 'provisioning',
+            tags: { blocksmtp: true }
+        });
+        d.rule = {
+            owner_uuid: d.vm.owner_uuid,
+            rule: 'FROM tag blocksmtp TO any BLOCK tcp PORT 25',
+            enabled: true
+        };
+
+        fw.add({ rules: [ d.rule ], vms: [ ] }, function (err, res) {
+            t.ifError(err);
+            if (err) {
+                return t.done();
+            }
+
+            helpers.fillInRuleBlanks(res.rules, d.rule);
+            t.deepEqual(res, {
+                vms: [],
+                rules: [ d.rule ]
+            }, 'result');
+
+            var rulesOnDisk = {};
+            rulesOnDisk[d.rule.uuid] = clone(d.rule);
+            t.deepEqual(helpers.rulesOnDisk(), rulesOnDisk,
+                'rules on disk OK');
+
+            return t.done();
+        });
+    },
+
+    'add local VM': function (t) {
+        fw.add({ localVMs: [ d.vm ], vms: [ d.vm ] },
+            function (err, res) {
+            t.ifError(err);
+            if (err) {
+                return t.done();
+            }
+
+            var ipfRules = {};
+
+            t.deepEqual(helpers.getIPFenabled(), {},
+                'firewall not active for VM');
+
+            // self.vm should have the rule applied to its ipf.conf, but
+            // because it's still provisioning, ipfilter will not be reloaded
+            // for the zone. Rather, rules will get loaded by the brand
+            // during zone boot
+            helpers.addZoneRules(ipfRules, [
+                [d.vm, 'default'],
+                [d.vm, 'out', 'block', 'tcp', 'any', 25]
+            ]);
+            t.deepEqual(helpers.zoneIPFconfigs(), ipfRules,
+                'zone ipf rules');
+
+            return t.done();
+        });
+    }
+};
+
+
+exports['tags that target no VMs'] = function (t) {
+    reset();
+    var vms = [ helpers.generateVM(), helpers.generateVM() ];
+    var rules = [
+        {
+            owner_uuid: vms[0].owner_uuid,
+            rule: 'FROM any TO tag doesnotexist ALLOW tcp PORT 80',
+            enabled: true
+        },
+        {
+            owner_uuid: vms[0].owner_uuid,
+            rule: 'FROM any TO tag exists = nada ALLOW tcp PORT 81',
+            enabled: true
+        }
+    ];
+
+    var expRules = {};
+    var expRulesOnDisk = {};
+    var remoteVMsOnDisk = {};
+    var vmsEnabled = {};
+
+    var payload = {
+        localVMs: vms,
+        rules: rules,
+        vms: vms
+    };
+
+    async.series([
+    function (cb) {
+        fw.validatePayload(payload, function (err, res) {
+            t.ifError(err);
+            return cb();
+        });
+
+    }, function (cb) {
+        fw.add(payload, function (err, res) {
+            t.ifError(err);
+            if (err) {
+                return cb();
+            }
+
+            helpers.fillInRuleBlanks(res.rules, rules);
+            t.deepEqual(helpers.sortRes(res), {
+                vms: helpers.sortedUUIDs(vms),
+                rules: [ rules[0], rules[1] ].sort(helpers.uuidSort)
+            }, 'rules returned');
+
+            helpers.addZoneRules(expRules, [
+                [vms[0], 'default'],
+                [vms[1], 'default']
+            ]);
+
+            t.deepEqual(helpers.zoneIPFconfigs(), expRules, 'firewall rules');
+
+            vmsEnabled[vms[0].uuid] = true;
+            vmsEnabled[vms[1].uuid] = true;
+            t.deepEqual(helpers.getIPFenabled(), vmsEnabled,
+                'firewalls enabled');
+
+            t.deepEqual(helpers.remoteVMsOnDisk(), remoteVMsOnDisk,
+                'remote VMs on disk');
+
+            expRulesOnDisk[rules[0].uuid] = clone(rules[0]);
+            expRulesOnDisk[rules[1].uuid] = clone(rules[1]);
+
+            t.deepEqual(helpers.rulesOnDisk(), expRulesOnDisk, 'rules on disk');
+
+            return cb();
+        });
+
+    }, function (cb) {
+        helpers.fwListEquals(t, rules, cb);
+
+    }, function (cb) {
+        helpers.fwRulesEqual({
+            t: t,
+            rules: [ ],
+            vm: vms[0],
+            vms: vms
+        }, cb);
+
+    }, function (cb) {
+        // Add a VM with the non-existent tag
+        vms.push(helpers.generateVM({ tags: { doesnotexist: true } }));
+
+        fw.add({ localVMs: [vms[2]], vms: vms }, function (err, res) {
+            t.ifError(err);
+            if (err) {
+                return cb();
+            }
+
+            t.deepEqual(helpers.sortRes(res), {
+                vms: [vms[2].uuid],
+                rules: []
+            }, 'vms returned');
+
+            helpers.addZoneRules(expRules, [
+                [vms[2], 'in', 'pass', 'tcp', 'any', 80]
+            ]);
+            t.deepEqual(helpers.zoneIPFconfigs(), expRules, 'firewall rules');
+
+            vmsEnabled[vms[2].uuid] = true;
+            t.deepEqual(helpers.getIPFenabled(), vmsEnabled,
+                'firewalls enabled');
+
+            t.deepEqual(helpers.remoteVMsOnDisk(), remoteVMsOnDisk,
+                'remote VMs on disk');
+
+            t.deepEqual(helpers.rulesOnDisk(), expRulesOnDisk, 'rules on disk');
+
+            return cb();
+        });
+    }
+
+    ], function () {
+        t.done();
     });
 };
 
@@ -1188,7 +1394,6 @@ exports['teardown'] = function (t) {
 if (runOne) {
     module.exports = {
         setup: exports.setup,
-        setUp: exports.setUp,
         oneTest: runOne,
         teardown: exports.teardown
     };

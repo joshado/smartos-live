@@ -20,7 +20,7 @@
  *
  * CDDL HEADER END
  *
- * Copyright (c) 2013, Joyent, Inc. All rights reserved.
+ * Copyright (c) 2015, Joyent, Inc. All rights reserved.
  *
  * * *
  * Error classes that imgadm may produce.
@@ -32,6 +32,16 @@ var assert = require('assert-plus');
 var verror = require('verror'),
     WError = verror.WError,
     VError = verror.VError;
+
+
+
+// ---- internal support stuff
+
+function _indent(s, indent) {
+    if (!indent) indent = '    ';
+    var lines = s.split(/\r?\n/g);
+    return indent + lines.join('\n' + indent);
+}
 
 
 
@@ -54,7 +64,10 @@ function ImgadmError(options) {
 
     var args = [];
     if (options.cause) args.push(options.cause);
-    args.push(options.message);
+    if (options.message) {
+        args.push('%s');
+        args.push(options.message);
+    }
     WError.apply(this, args);
 
     var extra = Object.keys(options).filter(
@@ -114,6 +127,40 @@ function ManifestValidationError(cause, errors) {
 }
 util.inherits(ManifestValidationError, ImgadmError);
 
+/**
+ * Errors when attempting to install/import an image when
+ * `requirements.min_platform` or `requirements.max_platform` fail.
+ *
+ * // JSSTYLED
+ * https://github.com/joyent/sdc-imgapi/blob/master/docs/index.md#manifest-requirementsmin_platform
+ */
+function MinPlatformError(platVer, platTimestamp, minPlatSpec) {
+    assert.string(platVer, 'platVer');
+    assert.string(platTimestamp, 'platTimestamp');
+    assert.object(minPlatSpec, 'minPlatSpec');
+    var message = format('current platform version, %s/%s, does not satisfy '
+        + 'requirements.min_platform=%j', platVer, platTimestamp, minPlatSpec);
+    ImgadmError.call(this, {
+        message: message,
+        code: 'MinPlatform'
+    });
+}
+util.inherits(MinPlatformError, ImgadmError);
+
+function MaxPlatformError(platVer, platTimestamp, maxPlatSpec) {
+    assert.string(platVer, 'platVer');
+    assert.string(platTimestamp, 'platTimestamp');
+    assert.object(maxPlatSpec, 'maxPlatSpec');
+    var message = format('current platform version, %s/%s, does not satisfy '
+        + 'requirements.max_platform=%j', platVer, platTimestamp, maxPlatSpec);
+    ImgadmError.call(this, {
+        message: message,
+        code: 'MaxPlatform'
+    });
+}
+util.inherits(MaxPlatformError, ImgadmError);
+
+
 function NoSourcesError() {
     ImgadmError.call(this, {
         message: 'imgadm has no configured sources',
@@ -135,20 +182,51 @@ function SourcePingError(cause, source) {
     }
     ImgadmError.call(this, {
         cause: cause,
-        message: format('unexpected ping error with image source "%s" (%s)%s',
-            source.url, source.type, details),
+        message: format('unexpected ping error with "%s" image source "%s"%s',
+            source.type, source.url, details),
         code: 'SourcePing',
         exitStatus: 1
     });
 }
 util.inherits(SourcePingError, ImgadmError);
 
+/**
+ * This is thrown if, while importing image A from a source IMGAPI, the image
+ * has an origin image B that is *not in that source*. That means there is
+ * a problem with the IMGAPI source: it is meant to be an invariant that
+ * an IMGAPI source has all images that make up the full origin chain for
+ * its images.
+ */
+function OriginNotFoundInSourceError(cause, originUuid, source) {
+    if (source === undefined) {  // `cause` is optional
+        source = originUuid;
+        originUuid = cause;
+        cause = undefined;
+    }
+    assert.string(originUuid, 'originUuid');
+    assert.object(source, 'source');
+    var details = '';
+    if (cause) {
+        details = ': ' + cause.toString();
+    }
+    ImgadmError.call(this, {
+        cause: cause,
+        message: format(
+            'origin image "%s" does not exist in image source "%s"%s',
+            originUuid, source.url, details),
+        code: 'OriginNotFoundInSource',
+        source: source.url,
+        exitStatus: 1
+    });
+}
+util.inherits(OriginNotFoundInSourceError, ImgadmError);
+
 function ImageNotFoundError(cause, uuid) {
     if (uuid === undefined) {
         uuid = cause;
         cause = undefined;
     }
-    assert.string(uuid);
+    assert.string(uuid, 'uuid');
     ImgadmError.call(this, {
         cause: cause,
         message: format('image "%s" was not found', uuid),
@@ -189,20 +267,135 @@ function VmNotStoppedError(cause, uuid) {
 }
 util.inherits(VmNotStoppedError, ImgadmError);
 
-function ActiveImageNotFoundError(cause, uuid) {
-    if (uuid === undefined) {
-        uuid = cause;
+// A VM must have an origin image to 'imgadm create' an *incremental* image.
+function VmHasNoOriginError(cause, vmUuid) {
+    if (vmUuid === undefined) {
+        vmUuid = cause;
         cause = undefined;
     }
-    assert.string(uuid);
+    assert.string(vmUuid, 'vmUuid');
     ImgadmError.call(this, {
         cause: cause,
-        message: format('an active image "%s" was not found', uuid),
+        message: format('cannot create an incremental image: vm "%s" has '
+            + 'no origin', vmUuid),
+        code: 'VmHasNoOrigin',
+        exitStatus: 1
+    });
+}
+util.inherits(VmHasNoOriginError, ImgadmError);
+
+function PrepareImageError(cause, vmUuid, details) {
+    if (details === undefined) {
+        details = vmUuid;
+        vmUuid = cause;
+        cause = undefined;
+    }
+    assert.string(vmUuid, 'vmUuid');
+    assert.string(details, 'details');
+    var extra = '';
+    if (details) {
+        if (details.indexOf('\n') !== -1) {
+            extra = ':\n' + _indent('...\n' + details);
+        } else {
+            extra = ': ' + details;
+        }
+    }
+    ImgadmError.call(this, {
+        cause: cause,
+        message: format('prepare-image script error while preparing VM %s%s',
+            vmUuid, extra),
+        code: 'PrepareImageError',
+        exitStatus: 1
+    });
+}
+util.inherits(PrepareImageError, ImgadmError);
+
+/**
+ * When the prepare-image script (used by `imgadm create -s prep-script`)
+ * does not set the 'prepare-image:state=running' mdata to indicate that it
+ * started running.
+ */
+function PrepareImageDidNotRunError(cause, vmUuid) {
+    if (vmUuid === undefined) {
+        vmUuid = cause;
+        cause = undefined;
+    }
+    assert.string(vmUuid, 'vmUuid');
+    ImgadmError.call(this, {
+        cause: cause,
+        message: format('prepare-image script did not run on VM %s boot',
+            vmUuid),
+        code: 'PrepareImageDidNotRun',
+        exitStatus: 1
+    });
+}
+util.inherits(PrepareImageDidNotRunError, ImgadmError);
+
+function TimeoutError(cause, msg) {
+    if (msg === undefined) {
+        msg = cause;
+        cause = undefined;
+    }
+    assert.string(msg, 'msg');
+    ImgadmError.call(this, {
+        cause: cause,
+        message: msg,
+        code: 'Timeout',
+        exitStatus: 1
+    });
+}
+util.inherits(TimeoutError, ImgadmError);
+
+// For *incremental* image creation the origin image must have a '@final'
+// snapshot from which the incr zfs send is taken. '@final' is what 'imgadm
+// install' ensures, but imported datasets from earlier 'imgadm' or pre-imgadm
+// might not have one.
+function OriginHasNoFinalSnapshotError(cause, originUuid) {
+    if (originUuid === undefined) {
+        originUuid = cause;
+        cause = undefined;
+    }
+    assert.string(originUuid, 'originUuid');
+    ImgadmError.call(this, {
+        cause: cause,
+        message: format('cannot create an incremental image: origin image "%s" '
+            + 'has no "@final" snapshot (sometimes this can be fixed by '
+            + '"imgadm update")', originUuid),
+        code: 'OriginHasNoFinalSnapshot',
+        exitStatus: 1
+    });
+}
+util.inherits(OriginHasNoFinalSnapshotError, ImgadmError);
+
+function ActiveImageNotFoundError(cause, arg) {
+    if (arg === undefined) {
+        arg = cause;
+        cause = undefined;
+    }
+    assert.string(arg, 'arg');
+    ImgadmError.call(this, {
+        cause: cause,
+        message: format('an active image "%s" was not found', arg),
         code: 'ActiveImageNotFound',
         exitStatus: 1
     });
 }
 util.inherits(ActiveImageNotFoundError, ImgadmError);
+
+function DockerRepoNotFoundError(cause, repo) {
+    if (repo === undefined) {
+        repo = cause;
+        cause = undefined;
+    }
+    assert.string(repo, 'repo');
+    ImgadmError.call(this, {
+        cause: cause,
+        message: format('docker repo "%s" was not found', repo),
+        code: 'DockerRepoNotFound',
+        exitStatus: 1
+    });
+}
+util.inherits(DockerRepoNotFoundError, ImgadmError);
 
 function ImageNotActiveError(cause, uuid) {
     if (uuid === undefined) {
@@ -260,6 +453,42 @@ function ImageHasDependentClonesError(cause, imageInfo) {
 }
 util.inherits(ImageHasDependentClonesError, ImgadmError);
 
+function OriginNotInstalledError(cause, zpool, uuid) {
+    if (uuid === undefined) {
+        // `cause` was not provided.
+        uuid = zpool;
+        zpool = cause;
+        cause = undefined;
+    }
+    assert.string(zpool, 'zpool');
+    assert.string(uuid, 'uuid');
+    ImgadmError.call(this, {
+        cause: cause,
+        message: format('origin image "%s" was not found on zpool "%s"',
+            uuid, zpool),
+        code: 'OriginNotInstalled',
+        exitStatus: 3
+    });
+}
+util.inherits(OriginNotInstalledError, ImgadmError);
+
+function MaxOriginDepthError(cause, max) {
+    if (max === undefined) {
+        // `cause` was not provided.
+        max = cause;
+        cause = undefined;
+    }
+    assert.number(max, 'MaxOriginDepth');
+    ImgadmError.call(this, {
+        cause: cause,
+        message: format('cannot create image: maximum origin depth "%s" '
+            + 'has been reached', max),
+        code: 'MaxOriginDepth',
+        exitStatus: 1
+    });
+}
+util.inherits(MaxOriginDepthError, ImgadmError);
+
 function InvalidUUIDError(cause, uuid) {
     if (uuid === undefined) {
         uuid = cause;
@@ -273,6 +502,20 @@ function InvalidUUIDError(cause, uuid) {
     });
 }
 util.inherits(InvalidUUIDError, ImgadmError);
+
+function InvalidArgumentError(cause, message) {
+    if (message === undefined) {
+        message = cause;
+        cause = undefined;
+    }
+    ImgadmError.call(this, {
+        cause: cause,
+        message: message,
+        code: 'InvalidArgument',
+        exitStatus: 1
+    });
+}
+util.inherits(InvalidArgumentError, ImgadmError);
 
 function InvalidManifestError(cause) {
     assert.optionalObject(cause);
@@ -306,6 +549,22 @@ function UnexpectedNumberOfSnapshotsError(uuid, snapnames) {
 }
 util.inherits(UnexpectedNumberOfSnapshotsError, ImgadmError);
 
+function ImageMissingOriginalSnapshotError(uuid, datasetGuid) {
+    assert.string(uuid, 'uuid');
+    assert.optionalString(datasetGuid, 'datasetGuid');
+    var extra = '';
+    if (datasetGuid) {
+        extra = ' (expected a snapshot with guid ' + datasetGuid + ')';
+    }
+    ImgadmError.call(this, {
+        message: format('image "%s" is missing its original snapshot%s',
+            uuid, extra),
+        code: 'ImageMissingOriginalSnapshot',
+        exitStatus: 1
+    });
+}
+util.inherits(ImageMissingOriginalSnapshotError, ImgadmError);
+
 function FileSystemError(cause, message) {
     if (message === undefined) {
         message = cause;
@@ -335,6 +594,21 @@ function UncompressionError(cause, message) {
     });
 }
 util.inherits(UncompressionError, ImgadmError);
+
+function NotSupportedError(cause, message) {
+    if (message === undefined) {
+        message = cause;
+        cause = undefined;
+    }
+    assert.string(message);
+    ImgadmError.call(this, {
+        cause: cause,
+        message: message,
+        code: 'NotSupported',
+        exitStatus: 1
+    });
+}
+util.inherits(NotSupportedError, ImgadmError);
 
 function UsageError(cause, message) {
     if (message === undefined) {
@@ -489,7 +763,7 @@ util.inherits(UpgradeError, ImgadmError);
  */
 function MultiError(errs) {
     assert.arrayOfObject(errs, 'errs');
-    var lines = [format('multiple (%d) API errors', errs.length)];
+    var lines = [format('multiple (%d) errors', errs.length)];
     for (var i = 0; i < errs.length; i++) {
         var err = errs[i];
         lines.push(format('    error (%s): %s', err.code, err.message));
@@ -512,20 +786,34 @@ module.exports = {
     ImgadmError: ImgadmError,
     InternalError: InternalError,
     InvalidUUIDError: InvalidUUIDError,
+    InvalidArgumentError: InvalidArgumentError,
+    MinPlatformError: MinPlatformError,
+    MaxPlatformError: MaxPlatformError,
     NoSourcesError: NoSourcesError,
     SourcePingError: SourcePingError,
+    OriginNotFoundInSourceError: OriginNotFoundInSourceError,
     ImageNotFoundError: ImageNotFoundError,
     VmNotFoundError: VmNotFoundError,
     VmNotStoppedError: VmNotStoppedError,
+    VmHasNoOriginError: VmHasNoOriginError,
+    PrepareImageError: PrepareImageError,
+    PrepareImageDidNotRunError: PrepareImageDidNotRunError,
+    TimeoutError: TimeoutError,
+    OriginHasNoFinalSnapshotError: OriginHasNoFinalSnapshotError,
     ManifestValidationError: ManifestValidationError,
     ActiveImageNotFoundError: ActiveImageNotFoundError,
+    DockerRepoNotFoundError: DockerRepoNotFoundError,
     ImageNotActiveError: ImageNotActiveError,
     ImageNotInstalledError: ImageNotInstalledError,
     ImageHasDependentClonesError: ImageHasDependentClonesError,
+    OriginNotInstalledError: OriginNotInstalledError,
+    MaxOriginDepthError: MaxOriginDepthError,
     InvalidManifestError: InvalidManifestError,
     UnexpectedNumberOfSnapshotsError: UnexpectedNumberOfSnapshotsError,
+    ImageMissingOriginalSnapshotError: ImageMissingOriginalSnapshotError,
     FileSystemError: FileSystemError,
     UncompressionError: UncompressionError,
+    NotSupportedError: NotSupportedError,
     UsageError: UsageError,
     UnknownOptionError: UnknownOptionError,
     UnknownCommandError: UnknownCommandError,

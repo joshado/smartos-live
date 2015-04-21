@@ -1,21 +1,22 @@
-// Copyright 2012 Joyent, Inc.  All rights reserved.
+// Copyright 2014 Joyent, Inc.  All rights reserved.
 //
 // Test invalid nic tag detection
 //
 
-process.env['TAP'] = 1;
 var async = require('/usr/node/node_modules/async');
 var cp = require('child_process');
 var dladm = require('/usr/vm/node_modules/dladm');
 var fs = require('fs');
-var test = require('tap').test;
 var util = require('util');
 var VM = require('/usr/vm/node_modules/VM');
 var vmtest = require('../common/vmtest.js');
 
+// this puts test stuff in global, so we need to tell jsl about that:
+/* jsl:import ../node_modules/nodeunit-plus/index.js */
+require('nodeunit-plus');
+
 VM.loglevel = 'DEBUG';
 var IMAGE_UUID = vmtest.CURRENT_SMARTOS_UUID;
-var TEST_OPTS = {'timeout': 240000};
 var VM_NUM = 0;
 
 
@@ -24,7 +25,7 @@ var VM_NUM = 0;
  * message of opts.err
  */
 function expectUpdateError(opts, cb) {
-    VM.update(opts.state.uuid, opts.payload, function(err) {
+    VM.update(opts.state.uuid, opts.payload, function (err) {
         opts.t.ok(err, opts.desc + ': update error expected');
         if (err) {
             opts.t.equal(err.message, opts.err,
@@ -39,72 +40,69 @@ function expectUpdateError(opts, cb) {
  * Generate a new unique VM alias
  */
 function alias() {
-    var alias = 'autozone-' + process.pid + '-' + VM_NUM;
-    VM_NUM++;
-    return alias;
+    return 'autozone-' + process.pid + '-' + VM_NUM++;
 }
 
 /*
  * Create a VM with the expected error message of opts.err
  */
 function expectCreateError(opts, cb) {
-    var state = {'brand': 'joyent-minimal', 'expect_create_failure': true };
-    vmtest.on_new_vm(opts.t, IMAGE_UUID,
-        { 'autoboot': false,
-          'do_not_inventory': true,
-          'alias': alias(),
-          'nowait': false,
-          'nics': opts.nics,
-        }, state, [],
-        function (err) {
-            opts.t.ok(state.hasOwnProperty('create_err'),
-                opts.desc + ': create_err set');
-            if (state.create_err) {
-                opts.t.equal(state.create_err.message, opts.err,
-                    opts.desc + ': create error message');
-            }
+    var state = {brand: 'joyent-minimal', expect_create_failure: true };
+    vmtest.on_new_vm(opts.t, IMAGE_UUID, {
+        autoboot: false,
+        do_not_inventory: true,
+        alias: alias(),
+        nowait: false,
+        nics: opts.nics
+    }, state, [], function (err) {
+        opts.t.ok(state.hasOwnProperty('create_err'),
+            opts.desc + ': create_err set');
 
-            if (cb) {
-                cb();
-                return;
-            } else {
-                opts.t.end();
-            }
-        });
+        if (state.create_err) {
+            opts.t.equal(state.create_err.message, opts.err,
+                opts.desc + ': create error message');
+        }
+
+        if (cb) {
+            return cb();
+        } else {
+            return opts.t.end();
+        }
+    });
 }
 
-test('vrrp vnics: updating', TEST_OPTS,
-    function(t) {
-    var state = {'brand': 'joyent-minimal'};
+test('vrrp vnics: updating', function (t) {
+    var state = {brand: 'joyent-minimal'};
     var vm;
     var vm_params = {
-        'autoboot': true,
-        'do_not_inventory': true,
-        'alias': alias(),
-        'nowait': false,
-        'nics': [
-          { 'nic_tag': 'external',
-            'vrrp_vrid': 1,
-            'ip': '172.18.1.101',
-            'netmask': '255.255.255.0',
-            'vrrp_primary_ip': '172.18.1.2'
-          },
-          { 'nic_tag': 'external',
-            'vrrp_vrid': 2,
-            'ip': '172.18.1.102',
-            'netmask': '255.255.255.0',
-            'vrrp_primary_ip': '172.18.1.2'
-          },
-          // The primary IP
-          { 'nic_tag': 'external',
-            'ip': '172.18.1.2',
-            'netmask': '255.255.255.0'
-          },
-          // A non-VRRP nic
-          { 'nic_tag': 'external',
-            'ip': '172.18.1.3',
-            'netmask': '255.255.255.0'
-          }
+        autoboot: true,
+        do_not_inventory: true,
+        alias: alias(),
+        nowait: false,
+        nics: [
+            {
+                nic_tag: 'external',
+                vrrp_vrid: 1,
+                ip: '172.18.1.101',
+                netmask: '255.255.255.0',
+                vrrp_primary_ip: '172.18.1.2'
+            }, {
+                nic_tag: 'external',
+                vrrp_vrid: 2,
+                ip: '172.18.1.102',
+                netmask: '255.255.255.0',
+                vrrp_primary_ip: '172.18.1.2'
+            }, {
+            // The primary IP
+                nic_tag: 'external',
+                ip: '172.18.1.2',
+                netmask: '255.255.255.0'
+            }, {
+            // A non-VRRP nic
+                nic_tag: 'external',
+                ip: '172.18.1.3',
+                netmask: '255.255.255.0'
+            }
         ]
     };
 
@@ -112,10 +110,10 @@ test('vrrp vnics: updating', TEST_OPTS,
     vmtest.on_new_vm(t, IMAGE_UUID, vm_params, state, [
         function (cb) {
             // Verify nic parameters
-            VM.load(state.uuid, function(err, obj) {
-                t.ifErr(err, 'loading new VM');
+            VM.load(state.uuid, function (err, obj) {
+                t.ifError(err, 'loading new VM');
                 if (!obj) {
-                    cb(err);
+                    return cb(err);
                 }
 
                 vm = obj;
@@ -135,14 +133,14 @@ test('vrrp vnics: updating', TEST_OPTS,
                 t.equal(obj.nics[1].mac, '00:00:5e:00:01:02',
                     'nic 1 VRRP MAC address');
 
-                cb();
+                return cb();
             });
 
         }, function (cb) {
             // Verify allowed IPs for net0
             dladm.showLinkProp(vm.zonename, 'net0', VM.log,
                 function (err, props) {
-                t.ifErr(err, 'show-linkprop for net0');
+                t.ifError(err, 'show-linkprop for net0');
                 if (err) {
                     return cb(err);
                 }
@@ -150,15 +148,16 @@ test('vrrp vnics: updating', TEST_OPTS,
                 // The VRRP nics should be allowed to send as the
                 // VRRP primary IP
                 t.deepEqual(props['allowed-ips'].sort(),
-                    ['172.18.1.101', '172.18.1.2'], 'net0 allowed-ips');
-                cb();
+                    ['172.18.1.101/32', '172.18.1.2/32'], 'net0 allowed-ips');
+
+                return cb();
             });
 
         }, function (cb) {
             // Verify allowed IPs for net1
             dladm.showLinkProp(vm.zonename, 'net1', VM.log,
                 function (err, props) {
-                t.ifErr(err, 'show-linkprop for net1');
+                t.ifError(err, 'show-linkprop for net1');
                 if (err) {
                     return cb(err);
                 }
@@ -166,36 +165,37 @@ test('vrrp vnics: updating', TEST_OPTS,
                 // The VRRP nics should be allowed to send as the
                 // VRRP primary IP
                 t.deepEqual(props['allowed-ips'].sort(),
-                    ['172.18.1.102', '172.18.1.2'], 'net1 allowed-ips');
-                cb();
+                    ['172.18.1.102/32', '172.18.1.2/32'], 'net1 allowed-ips');
+
+                return cb();
             });
 
         }, function (cb) {
             // Should not allow updating to another nic's VRID
             var payload = {
-              'update_nics': [
-                  {
-                      mac: vm.nics[0].mac,
-                      vrrp_vrid: 2
-                  }
-              ]
+                update_nics: [
+                    {
+                        mac: vm.nics[0].mac,
+                        vrrp_vrid: 2
+                    }
+                ]
             };
 
-            VM.update(state.uuid, payload, function(err) {
+            VM.update(state.uuid, payload, function (err) {
                 t.ok(err, 'error updating to conflicting VRID');
                 if (err) {
                     t.equal(err.message,
-                      'Cannot add multiple NICs with the same VRID: 2',
-                      'update error message');
+                        'Cannot add multiple NICs with the same VRID: 2',
+                        'update error message');
                 }
 
-                cb();
+                return cb();
             });
 
         }, function (cb) {
             // Actually update
             var payload = {
-                'update_nics': [
+                update_nics: [
                     {
                         mac: vm.nics[0].mac,
                         vrrp_vrid: 3
@@ -203,22 +203,21 @@ test('vrrp vnics: updating', TEST_OPTS,
                 ]
             };
 
-            VM.update(state.uuid, payload, function(err) {
-                t.ifErr(err, 'update error: net0 to VRID 3');
+            VM.update(state.uuid, payload, function (err) {
+                t.ifError(err, 'update error: net0 to VRID 3');
                 if (err) {
-                    cb(err);
-                    return;
+                    return cb(err);
                 }
-                cb();
+
+                return cb();
             });
 
         }, function (cb) {
             // Check the updated values
-            VM.load(state.uuid, function(err, obj) {
-                t.ifErr(err, 'load error');
+            VM.load(state.uuid, function (err, obj) {
+                t.ifError(err, 'load error');
                 if (err) {
-                    cb(err);
-                    return;
+                    return cb(err);
                 }
                 vm = obj;
 
@@ -237,7 +236,8 @@ test('vrrp vnics: updating', TEST_OPTS,
                     'nic 0 VRRP MAC address');
                 t.equal(obj.nics[1].mac, '00:00:5e:00:01:02',
                     'nic 1 VRRP MAC address');
-                cb();
+
+                return cb();
             });
 
         }, function (cb) {
@@ -245,7 +245,7 @@ test('vrrp vnics: updating', TEST_OPTS,
             expectUpdateError({
                 state: state,
                 payload: {
-                    'add_nics': [
+                    add_nics: [
                         {
                             mac: '52:31:98:52:5d:07:d0',
                             nic_tag: 'external',
@@ -265,7 +265,7 @@ test('vrrp vnics: updating', TEST_OPTS,
             expectUpdateError({
                 state: state,
                 payload: {
-                    'update_nics': [
+                    update_nics: [
                         {
                             mac: vm.nics[0].mac,
                             vrrp_primary_ip: '172.18.1.254',
@@ -284,7 +284,7 @@ test('vrrp vnics: updating', TEST_OPTS,
             expectUpdateError({
                 state: state,
                 payload: {
-                    'update_nics': [
+                    update_nics: [
                         {
                             mac: vm.nics[2].mac,
                             vrrp_vrid: 14
@@ -302,7 +302,7 @@ test('vrrp vnics: updating', TEST_OPTS,
             expectUpdateError({
                 state: state,
                 payload: {
-                    'add_nics': [
+                    add_nics: [
                         {
                             ip: 'dhcp',
                             nic_tag: 'external',
@@ -322,7 +322,7 @@ test('vrrp vnics: updating', TEST_OPTS,
             expectUpdateError({
                 state: state,
                 payload: {
-                    'add_nics': [
+                    add_nics: [
                         {
                             nic_tag: 'external',
                             ip: '172.18.1.117',
@@ -343,7 +343,7 @@ test('vrrp vnics: updating', TEST_OPTS,
             expectUpdateError({
                 state: state,
                 payload: {
-                    'add_nics': [
+                    add_nics: [
                         {
                             nic_tag: 'external',
                             ip: '172.18.1.118',
@@ -363,7 +363,7 @@ test('vrrp vnics: updating', TEST_OPTS,
             expectUpdateError({
                 state: state,
                 payload: {
-                    'update_nics': [
+                    update_nics: [
                         {
                             mac: vm.nics[3].mac,
                             vrrp_vrid: 18
@@ -380,7 +380,7 @@ test('vrrp vnics: updating', TEST_OPTS,
             expectUpdateError({
                 state: state,
                 payload: {
-                    'remove_nics': [
+                    remove_nics: [
                         vm.nics[1].mac,
                         vm.nics[2].mac,
                         vm.nics[3].mac
@@ -396,7 +396,7 @@ test('vrrp vnics: updating', TEST_OPTS,
             expectUpdateError({
                 state: state,
                 payload: {
-                    'remove_nics': [
+                    remove_nics: [
                         vm.nics[2].mac,
                         vm.nics[3].mac
                     ]
@@ -411,7 +411,7 @@ test('vrrp vnics: updating', TEST_OPTS,
             expectUpdateError({
                 state: state,
                 payload: {
-                    'update_nics': [
+                    update_nics: [
                         {
                             mac: vm.nics[0].mac,
                             vrrp_vrid: 256
@@ -428,7 +428,7 @@ test('vrrp vnics: updating', TEST_OPTS,
             expectUpdateError({
                 state: state,
                 payload: {
-                    'update_nics': [
+                    update_nics: [
                         {
                             mac: vm.nics[0].mac,
                             vrrp_vrid: -1
@@ -445,7 +445,7 @@ test('vrrp vnics: updating', TEST_OPTS,
             expectUpdateError({
                 state: state,
                 payload: {
-                    'remove_nics': [
+                    remove_nics: [
                         vm.nics[2].mac
                     ]
                 },
@@ -457,30 +457,29 @@ test('vrrp vnics: updating', TEST_OPTS,
         }, function (cb) {
             // Update vrrp_primary_ip to the other non-VRRP nic
             var payload = {
-                'update_nics': [
+                update_nics: [
                     {
                         mac: vm.nics[0].mac,
-                        'vrrp_primary_ip': '172.18.1.3'
+                        vrrp_primary_ip: '172.18.1.3'
                     }
                 ]
             };
 
-            VM.update(state.uuid, payload, function(err) {
-                t.ifErr(err, 'update error: vrrp_primary_ip of net0');
+            VM.update(state.uuid, payload, function (err) {
+                t.ifError(err, 'update error: vrrp_primary_ip of net0');
                 if (err) {
-                    cb(err);
-                    return;
+                    return cb(err);
                 }
-                cb();
+
+                return cb();
             });
 
         }, function (cb) {
             // Check the updated values
-            VM.load(state.uuid, function(err, obj) {
-                t.ifErr(err, 'load error');
+            VM.load(state.uuid, function (err, obj) {
+                t.ifError(err, 'load error');
                 if (err) {
-                    cb(err);
-                    return;
+                    return cb(err);
                 }
                 vm = obj;
 
@@ -490,49 +489,54 @@ test('vrrp vnics: updating', TEST_OPTS,
                     'nic 0 valid VRRP primary IP');
                 t.equal(obj.nics[0].mac, '00:00:5e:00:01:03',
                     'nic 0 VRRP MAC address');
-                cb();
+
+                return cb();
             });
 
         }, function (cb) {
             // Allowed IPs for net0 should reflect the new vrrp_primary_ip
             dladm.showLinkProp(vm.zonename, 'net0', VM.log,
                 function (err, props) {
-                t.ifErr(err, 'show-linkprop for net0');
+                t.ifError(err, 'show-linkprop for net0');
                 if (err) {
                     return cb(err);
                 }
 
                 t.deepEqual(props['allowed-ips'].sort(),
-                    ['172.18.1.101', '172.18.1.3'], 'net0 allowed-ips');
-                cb();
+                    ['172.18.1.101/32', '172.18.1.3/32'], 'net0 allowed-ips');
+
+                return cb();
             });
 
         }, function (cb) {
             // Should not allow creating more than 1 VM with the same VRID
             vm_params.nics = [
-                { 'nic_tag': 'external',
-                  'vrrp_vrid': 2,
-                  'ip': '172.18.1.202',
-                  'netmask': '255.255.255.0',
-                  'vrrp_primary_ip': '172.18.1.203'
-                },
-                { 'nic_tag': 'external',
-                  'ip': '172.18.1.203',
-                  'netmask': '255.255.255.0'
+                {
+                    nic_tag: 'external',
+                    vrrp_vrid: 2,
+                    ip: '172.18.1.202',
+                    netmask: '255.255.255.0',
+                    vrrp_primary_ip: '172.18.1.203'
+                }, {
+                    nic_tag: 'external',
+                    ip: '172.18.1.203',
+                    netmask: '255.255.255.0'
                 }
             ];
             vm_params.alias = alias();
             expectCreateError({
-                'nics': [
-                    { 'nic_tag': 'external',
-                      'vrrp_vrid': 3,
-                      'ip': '172.18.1.202',
-                      'netmask': '255.255.255.0',
-                      'vrrp_primary_ip': '172.18.1.203'
+                nics: [
+                    {
+                        nic_tag: 'external',
+                        vrrp_vrid: 3,
+                        ip: '172.18.1.202',
+                        netmask: '255.255.255.0',
+                        vrrp_primary_ip: '172.18.1.203'
                     },
-                    { 'nic_tag': 'external',
-                      'ip': '172.18.1.203',
-                      'netmask': '255.255.255.0'
+                    {
+                        nic_tag: 'external',
+                        ip: '172.18.1.203',
+                        netmask: '255.255.255.0'
                     }
                 ],
                 t: t,
@@ -547,31 +551,31 @@ test('vrrp vnics: updating', TEST_OPTS,
     });
 });
 
-test('create with both mac and vrrp_vid', TEST_OPTS, function(t) {
+test('create with both mac and vrrp_vid', function (t) {
     expectCreateError({
-        nics: [
-            { 'mac': '52:31:98:52:5d:07:d1',
-              'vrrp_vrid': 9
-            }
-        ],
+        nics: [ {
+                mac: '52:31:98:52:5d:07:d1',
+                vrrp_vrid: 9
+        } ],
         t: t,
         err: 'Cannot set both mac and vrrp_vrid',
         desc: 'both mac and vrrp_vrid set'
     });
 });
 
-test('create with vrrp_primary_ip set to a VRRP nic', TEST_OPTS, function(t) {
+test('create with vrrp_primary_ip set to a VRRP nic', function (t) {
     expectCreateError({
         nics: [
-            { 'ip': '172.18.1.110',
-              'nic_tag': 'external',
-              'netmask': '255.255.255.0',
-              'vrrp_vrid': 31
-            },
-            { 'ip': 'dhcp',
-              'nic_tag': 'external',
-              'vrrp_vrid': 32,
-              'vrrp_primary_ip': '172.18.1.110'
+            {
+                ip: '172.18.1.110',
+                nic_tag: 'external',
+                netmask: '255.255.255.0',
+                vrrp_vrid: 31
+            }, {
+                ip: 'dhcp',
+                nic_tag: 'external',
+                vrrp_vrid: 32,
+                vrrp_primary_ip: '172.18.1.110'
             }
         ],
         t: t,
@@ -580,39 +584,37 @@ test('create with vrrp_primary_ip set to a VRRP nic', TEST_OPTS, function(t) {
     });
 });
 
-test('create with vrrp_primary_ip set to a foreign IP', TEST_OPTS,
-    function(t) {
+test('create with vrrp_primary_ip set to a foreign IP', function (t) {
     expectCreateError({
         nics: [
-            { 'ip': '172.18.1.111',
-              'netmask': '255.255.255.0',
-              'nic_tag': 'external'
-            },
-            { 'ip': 'dhcp',
-              'nic_tag': 'external',
-              'vrrp_vrid': 33,
-              'vrrp_primary_ip': '172.18.1.254'
-            }
-        ],
+            {
+                ip: '172.18.1.111',
+                netmask: '255.255.255.0',
+                nic_tag: 'external'
+            }, {
+                ip: 'dhcp',
+                nic_tag: 'external',
+                vrrp_vrid: 33,
+                vrrp_primary_ip: '172.18.1.254'
+        } ],
         t: t,
         err: 'vrrp_primary_ip must belong to the same VM',
         desc: 'vrrp_primary_ip set to foreign ip'
     });
 });
 
-test('create with vrrp_primary_ip set to self', TEST_OPTS, function(t) {
+test('create with vrrp_primary_ip set to self', function (t) {
     expectCreateError({
         nics: [
             {
-                'nic_tag': 'external',
-                'ip': '172.18.1.127',
-                'netmask': '255.255.255.0',
-                'vrrp_vrid': 26,
-                'vrrp_primary_ip': '172.18.1.127'
-            },
-            {
-                'ip': 'dhcp',
-                'nic_tag': 'external'
+                nic_tag: 'external',
+                ip: '172.18.1.127',
+                netmask: '255.255.255.0',
+                vrrp_vrid: 26,
+                vrrp_primary_ip: '172.18.1.127'
+            }, {
+                ip: 'dhcp',
+                nic_tag: 'external'
             }
         ],
         t: t,
@@ -621,19 +623,17 @@ test('create with vrrp_primary_ip set to self', TEST_OPTS, function(t) {
     });
 });
 
-test('create with vrrp_vrid set but not vrrp_primary_ip', TEST_OPTS,
-    function(t) {
+test('create with vrrp_vrid set but not vrrp_primary_ip', function (t) {
     expectCreateError({
         nics: [
             {
-                'nic_tag': 'external',
-                'ip': '172.18.1.127',
-                'netmask': '255.255.255.0',
-                'vrrp_vrid': 27
-            },
-            {
-                'ip': 'dhcp',
-                'nic_tag': 'external'
+                nic_tag: 'external',
+                ip: '172.18.1.127',
+                netmask: '255.255.255.0',
+                vrrp_vrid: 27
+            }, {
+                ip: 'dhcp',
+                nic_tag: 'external'
             }
         ],
         t: t,
@@ -642,47 +642,40 @@ test('create with vrrp_vrid set but not vrrp_primary_ip', TEST_OPTS,
     });
 });
 
-test('create with only a VRRP nic', TEST_OPTS,
-    function(t) {
+test('create with only a VRRP nic', function (t) {
     expectCreateError({
-        nics: [
-            {
-                'nic_tag': 'external',
-                'ip': '172.18.1.127',
-                'netmask': '255.255.255.0',
-                'vrrp_vrid': 27,
-                'vrrp_primary_ip': '172.18.1.2'
-            }
-        ],
+        nics: [ {
+            nic_tag: 'external',
+            ip: '172.18.1.127',
+            netmask: '255.255.255.0',
+            vrrp_vrid: 27,
+            vrrp_primary_ip: '172.18.1.2'
+        } ],
         t: t,
         err: 'VM cannot contain only VRRP nics',
         desc: 'create with only a VRRP nic'
     });
 });
 
-test('create: 2 nics with same VRID', TEST_OPTS,
-    function(t) {
+test('create: 2 nics with same VRID', function (t) {
     expectCreateError({
-        nics: [
-            {
-                'ip': '172.18.1.127',
-                'netmask': '255.255.255.0',
-                'nic_tag': 'external',
-                'vrrp_vrid': 27,
-                'vrrp_primary_ip': '172.18.1.129'
-            },
-            {
-                'ip': '172.18.1.128',
-                'netmask': '255.255.255.0',
-                'nic_tag': 'external',
-                'vrrp_vrid': 27,
-                'vrrp_primary_ip': '172.18.1.129'
-            },
-            {
-                'ip': '172.18.1.128',
-                'netmask': '255.255.255.0',
-                'nic_tag': 'external'
-            },
+        nics: [ {
+                ip: '172.18.1.127',
+                netmask: '255.255.255.0',
+                nic_tag: 'external',
+                vrrp_vrid: 27,
+                vrrp_primary_ip: '172.18.1.129'
+            }, {
+                ip: '172.18.1.128',
+                netmask: '255.255.255.0',
+                nic_tag: 'external',
+                vrrp_vrid: 27,
+                vrrp_primary_ip: '172.18.1.129'
+            }, {
+                ip: '172.18.1.128',
+                netmask: '255.255.255.0',
+                nic_tag: 'external'
+            }
         ],
         t: t,
         err: 'Cannot add multiple NICs with the same VRID: 27',

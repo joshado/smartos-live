@@ -68,7 +68,9 @@
 	<device match="dsk" />
 	<device match="dtrace/*" />
 	<device match="dtrace/provider/*" />
+	<device match="eventfd" />
 	<device match="fd" />
+	<device match="inotify" />
 	<device match="ipnet" />
 	<device match="kstat" />
 	<device match="lo0" />
@@ -102,12 +104,17 @@
 	<device match="ticlts" />
 	<device match="ticots" />
 	<device match="ticotsord" />
+	<device match="timerfd" />
 	<device match="tty" />
 	<device match="tun" />
 	<device match="udp" />
 	<device match="udp6" />
 	<device match="urandom" />
+	<device match="vnd/*" />
 	<device match="zero" />
+	<device match="zfd/%z/slave/0" name="zfd/0" />
+	<device match="zfd/%z/slave/1" name="zfd/1" />
+	<device match="zfd/%z/slave/2" name="zfd/2" />
 	<device match="zfs" />
 	<device match="zvol/dsk/%P/%z/*" />
 	<device match="zvol/rdsk/%P/%z/*" />

@@ -57,6 +57,10 @@ exports.setUp = function (cb) {
 exports['add: no rules or VMs'] = function (t) {
     fw.add({}, function (err, res) {
         t.ok(err, 'error returned');
+        if (!err) {
+            return t.done();
+        }
+
         t.equal(err.message, 'opts.vms ([object]) required', 'VMs required');
         t.done();
     });
@@ -84,6 +88,7 @@ exports['add / update: vm to IP: BLOCK'] = function (t) {
     var payload = {
         rules: [
             {
+                owner_uuid: vm.owner_uuid,
                 rule: util.format('FROM vm %s TO ip 10.99.99.254 BLOCK tcp '
                                 + 'PORT 8080', vm.uuid),
                 enabled: true
@@ -104,15 +109,13 @@ exports['add / update: vm to IP: BLOCK'] = function (t) {
 
             t.ok(res.rules[0].uuid, 'rule has a uuid');
             expRule.uuid = res.rules[0].uuid;
-            delete res.rules[0].uuid;
 
             t.ok(res.rules[0].version, 'rule has a version');
             expRule.version = res.rules[0].version;
-            delete res.rules[0].version;
 
             t.deepEqual(res, {
                 vms: [ vm.uuid ],
-                rules: [ payload.rules[0] ]
+                rules: [ expRule ]
             }, 'rules returned');
 
             var zoneRules = helpers.zoneIPFconfigs();
@@ -139,10 +142,17 @@ exports['add / update: vm to IP: BLOCK'] = function (t) {
         helpers.fwListEquals(t, [expRule], cb);
 
     }, function (cb) {
+        helpers.vmsAffected({
+            t: t,
+            allVMs: [vm],
+            rule: expRule,
+            vms: [vm]
+        }, cb);
+
+    }, function (cb) {
         var updatePayload = {
             rules: [
                 {
-                    enabled: true,
                     rule: util.format(
                         'FROM vm %s TO (ip 10.88.88.2 OR ip 10.99.99.254) '
                         + 'BLOCK tcp PORT 8080', vm.uuid),
@@ -158,18 +168,17 @@ exports['add / update: vm to IP: BLOCK'] = function (t) {
                 return cb();
             }
 
-            t.ok(res.rules[0].uuid, 'rule has a uuid');
             t.equal(res.rules[0].uuid, expRule.uuid, 'uuid is the same');
-
             t.ok(res.rules[0].version, 'rule has a version');
-            expRule.version = res.rules[0].version;
-            delete res.rules[0].version;
+            t.notEqual(res.rules[0].version, expRule.version,
+                'rule version changed');
 
-            expRule.rule = res.rules[0].rule;
+            expRule.version = res.rules[0].version;
+            expRule.rule = updatePayload.rules[0].rule;
 
             t.deepEqual(res, {
                 vms: [ vm.uuid ],
-                rules: [ updatePayload.rules[0] ]
+                rules: [ expRule ]
             }, 'rules returned');
 
             var zoneRules = helpers.zoneIPFconfigs();
@@ -196,6 +205,14 @@ exports['add / update: vm to IP: BLOCK'] = function (t) {
             t: t,
             rules: [ expRule ],
             vm: vm,
+            vms: [vm]
+        }, cb);
+
+    }, function (cb) {
+        helpers.vmsAffected({
+            t: t,
+            allVMs: [vm],
+            rule: expRule,
             vms: [vm]
         }, cb);
 
@@ -260,6 +277,7 @@ exports['add / update: vm to IP: ALLOW'] = function (t) {
     var payload = {
         rules: [
             {
+                owner_uuid: vm.owner_uuid,
                 rule: util.format('FROM vm %s TO ip 10.99.99.254 ALLOW tcp '
                                 + 'PORT 8080', vm.uuid),
                 enabled: true
@@ -306,6 +324,14 @@ exports['add / update: vm to IP: ALLOW'] = function (t) {
         helpers.fwListEquals(t, [expRule], cb);
 
     }, function (cb) {
+        helpers.vmsAffected({
+            t: t,
+            allVMs: [vm],
+            rule: expRule,
+            vms: [vm]
+        }, cb);
+
+    }, function (cb) {
         helpers.fwRulesEqual({
             t: t,
             rules: [expRule],
@@ -326,6 +352,7 @@ exports['add: tag to IP'] = function (t) {
     var payload = {
         rules: [
             {
+                owner_uuid: vm1.owner_uuid,
                 rule: 'FROM tag foo TO ip 10.99.99.254 BLOCK tcp PORT 25',
                 enabled: true
             }
@@ -386,6 +413,14 @@ exports['add: tag to IP'] = function (t) {
         helpers.fwListEquals(t, [expRule], cb);
 
     }, function (cb) {
+        helpers.vmsAffected({
+            t: t,
+            allVMs: [vm1, vm2],
+            rule: expRule,
+            vms: [vm1, vm2]
+        }, cb);
+
+    }, function (cb) {
         helpers.fwRulesEqual({
             t: t,
             rules: [expRule],
@@ -413,10 +448,12 @@ exports['add: tag to subnet'] = function (t) {
     var payload = {
         rules: [
             {
+                owner_uuid: vm1.owner_uuid,
                 rule: 'FROM tag foo TO subnet 10.99.99.0/24 BLOCK tcp PORT 25',
                 enabled: true
             },
             {
+                owner_uuid: vm2.owner_uuid,
                 rule: 'FROM subnet 10.99.99.0/24 TO tag foo ALLOW tcp PORT 80',
                 enabled: true
             }
@@ -503,6 +540,22 @@ exports['add: tag to subnet'] = function (t) {
         }, cb);
 
     }, function (cb) {
+        helpers.vmsAffected({
+            t: t,
+            allVMs: [vm1, vm2],
+            rule: rule1,
+            vms: [vm1, vm2]
+        }, cb);
+
+    }, function (cb) {
+        helpers.vmsAffected({
+            t: t,
+            allVMs: [vm1, vm2],
+            rule: rule2,
+            vms: [vm1, vm2]
+        }, cb);
+
+    }, function (cb) {
         helpers.testEnableDisable({
             t: t,
             vm: vm1,
@@ -522,12 +575,14 @@ exports['add: vm to subnet'] = function (t) {
     var payload = {
         rules: [
             {
+                owner_uuid: vm1.owner_uuid,
                 rule: util.format(
                     'FROM vm %s TO subnet 10.99.99.0/24 BLOCK tcp PORT 25',
                     vm1.uuid),
                 enabled: true
             },
             {
+                owner_uuid: vm2.owner_uuid,
                 rule: util.format(
                     'FROM subnet 10.99.99.0/24 TO vm %s ALLOW tcp PORT 80',
                     vm1.uuid),
@@ -612,6 +667,40 @@ exports['add: vm to subnet'] = function (t) {
             vm: vm2,
             vms: [vm1, vm2]
         }, cb);
+
+    }, function (cb) {
+        helpers.vmsAffected({
+            t: t,
+            allVMs: [vm1, vm2],
+            rule: rule1,
+            vms: [vm1]
+        }, cb);
+
+    }, function (cb) {
+        // Ensure we can use the rule UUID to check
+        helpers.vmsAffected({
+            t: t,
+            allVMs: [vm1, vm2],
+            rule: rule1.uuid,
+            vms: [vm1]
+        }, cb);
+
+    }, function (cb) {
+        helpers.vmsAffected({
+            t: t,
+            allVMs: [vm1, vm2],
+            rule: rule2,
+            vms: [vm1]
+        }, cb);
+
+    }, function (cb) {
+        // Ensure we can use the rule UUID to check
+        helpers.vmsAffected({
+            t: t,
+            allVMs: [vm1, vm2],
+            rule: rule2.uuid,
+            vms: [vm1]
+        }, cb);
     }
     ], function () {
             t.done();
@@ -624,6 +713,7 @@ exports['enable / disable rule'] = function (t) {
     var payload = {
         rules: [
             {
+                owner_uuid: vm.owner_uuid,
                 rule: util.format('FROM vm %s TO ip 192.168.5.2 BLOCK tcp '
                                 + 'PORT 25', vm.uuid),
                 enabled: false
@@ -633,6 +723,7 @@ exports['enable / disable rule'] = function (t) {
     };
 
     var expRule = clone(payload.rules[0]);
+    var expRule2;
     var vmsEnabled = {};
     var zoneIPFconfs;
 
@@ -677,6 +768,16 @@ exports['enable / disable rule'] = function (t) {
         }, cb);
 
     }, function (cb) {
+        // Even though the rule is disabled, it should still show up as
+        // affected
+        helpers.vmsAffected({
+            t: t,
+            allVMs: [vm],
+            rule: expRule,
+            vms: [vm]
+        }, cb);
+
+    }, function (cb) {
         // Update the rule - it should still not affect the VM
         var updatePayload = {
             rules: [
@@ -716,13 +817,14 @@ exports['enable / disable rule'] = function (t) {
         var addPayload = {
             rules: [
                 {
+                    owner_uuid: vm.owner_uuid,
                     rule: 'FROM any TO all vms ALLOW tcp PORT 33',
                     enabled: true
                 }
             ],
             vms: [vm]
         };
-        var expRule2 = clone(addPayload.rules[0]);
+        expRule2 = clone(addPayload.rules[0]);
 
         fw.add(addPayload, function (err, res) {
             t.ifError(err);
@@ -748,10 +850,40 @@ exports['enable / disable rule'] = function (t) {
 
             cb();
         });
+
+    }, function (cb) {
+        helpers.vmsAffected({
+            t: t,
+            allVMs: [vm],
+            rule: expRule,
+            vms: [vm]
+        }, cb);
+
+    }, function (cb) {
+        helpers.vmsAffected({
+            t: t,
+            allVMs: [vm],
+            rule: expRule2,
+            vms: [vm]
+        }, cb);
     }
 
     ], function () {
             t.done();
+    });
+};
+
+
+exports['del: no uuids or rvmUUIDs'] = function (t) {
+    fw.del({ vms: [ helpers.generateVM() ] }, function (err, res) {
+        t.ok(err, 'error returned');
+        if (!err) {
+            return t.done();
+        }
+
+        t.equal(err.message, 'Payload must contain one of: rvmUUIDs, uuids',
+            'Error message');
+        t.done();
     });
 };
 

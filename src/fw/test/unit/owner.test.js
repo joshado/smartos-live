@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2013, Joyent, Inc. All rights reserved.
  *
- * fwadm tests
+ * test rules with owner_uuid set
  */
 
 var async = require('async');
@@ -88,7 +88,7 @@ exports['tag to IP'] = function (t) {
             t.deepEqual(res, {
                 vms: [ vm2.uuid ],
                 rules: [ payload.rules[0] ]
-            }, 'rules returned');
+            }, 'add 1: rules returned');
 
             var zoneRules = helpers.zoneIPFconfigs();
             var expRules = helpers.defaultZoneRules(vm2.uuid);
@@ -126,7 +126,8 @@ exports['tag to IP'] = function (t) {
             rules: [
                 {
                     rule: 'FROM tag foo TO ip 10.99.99.254 BLOCK tcp PORT 250',
-                    enabled: true
+                    enabled: true,
+                    global: true
                 }
             ],
             vms: [vm1, vm2]
@@ -149,7 +150,7 @@ exports['tag to IP'] = function (t) {
             t.deepEqual(res, {
                 vms: [ vm1.uuid, vm2.uuid ],
                 rules: [ payload2.rules[0] ]
-            }, 'rules returned');
+            }, 'add 2: rules returned');
 
             var zoneRules = helpers.zoneIPFconfigs();
             var expRules = helpers.defaultZoneRules([vm1.uuid, vm2.uuid]);
@@ -189,12 +190,14 @@ exports['tag to IP'] = function (t) {
             rules: [
                 {
                     uuid: expRule2.uuid,
-                    owner_uuid: owner
+                    owner_uuid: owner,
+                    version: expRule2.version
                 }
             ],
             vms: [vm1, vm2]
         };
         expRule2.owner_uuid = owner;
+        delete expRule2.global;
 
         fw.update(payload3, function (err, res) {
             t.ifError(err);
@@ -207,7 +210,7 @@ exports['tag to IP'] = function (t) {
                 // written out, and vm2 has the default plus rule 2
                 vms: [ vm2.uuid, vm1.uuid ],
                 rules: [ expRule2 ]
-            }, 'rules returned');
+            }, 'update: rules returned');
 
             var zoneRules = helpers.zoneIPFconfigs();
             var expRules = helpers.defaultZoneRules([vm1.uuid, vm2.uuid]);
@@ -335,8 +338,9 @@ exports['all vms (local and remote)'] = function (t) {
 
             helpers.fillInRuleBlanks(res.rules, expRules);
             t.deepEqual(helpers.sortRes(res), {
+                remoteVMs: helpers.sortedUUIDs([ rvm1, rvm2, rvm3 ]),
                 rules: clone(expRules).sort(helpers.uuidSort),
-                vms: [ vm1.uuid, vm2.uuid ].sort()
+                vms: helpers.sortedUUIDs([ vm1, vm2 ])
             }, 'rules returned');
 
             zoneRules = helpers.defaultZoneRules([vm1.uuid, vm2.uuid]);
@@ -381,6 +385,7 @@ exports['all vms (local and remote)'] = function (t) {
         var addPayload = {
             rules: [
                 {
+                    global: true,
                     rule: 'FROM all vms TO all vms ALLOW tcp PORT 8083',
                     enabled: true
                 }
@@ -397,7 +402,7 @@ exports['all vms (local and remote)'] = function (t) {
 
             helpers.fillInRuleBlanks(res.rules, expRules[2]);
             t.deepEqual(helpers.sortRes(res), {
-                vms: [ vm1.uuid, vm2.uuid, vm3.uuid ].sort(),
+                vms: helpers.sortedUUIDs([ vm1, vm2, vm3 ]),
                 rules: [ expRules[2] ]
             }, 'rules returned');
 
@@ -463,11 +468,12 @@ exports['all vms (local and remote)'] = function (t) {
                 return cb();
             }
 
-            t.ok(res.rules[0].version, 'rule has a version');
-            expRules[1].version = res.rules[0].version;
+            t.notEqual(res.rules[0].version, expRules[0].version,
+                'rule version changed');
+            expRules[0].version = res.rules[0].version;
 
             t.deepEqual(helpers.sortRes(res), {
-                vms: [ vm1.uuid, vm2.uuid ].sort(),
+                vms: helpers.sortedUUIDs([ vm1, vm2 ]),
                 rules: [ expRules[0] ]
             }, 'rules returned');
 
@@ -513,7 +519,7 @@ exports['all vms (local and remote)'] = function (t) {
             }
 
             t.deepEqual(helpers.sortRes(res), {
-                vms: [ vm1.uuid, vm2.uuid ].sort(),
+                vms: helpers.sortedUUIDs([ vm1, vm2 ]),
                 rules: [ expRules[1] ]
             }, 'results returned');
 
@@ -613,8 +619,9 @@ exports['remote vms: tags'] = function (t) {
 
             helpers.fillInRuleBlanks(res.rules, expRules);
             t.deepEqual(helpers.sortRes(res), {
+                remoteVMs: helpers.sortedUUIDs([ rvm1, rvm2, rvm3 ]),
                 rules: clone(expRules).sort(helpers.uuidSort),
-                vms: [ vm1.uuid ].sort()
+                vms: [ vm1.uuid ]
             }, 'rules returned');
 
             zoneRules = helpers.defaultZoneRules(vm1.uuid);
@@ -705,8 +712,9 @@ exports['remote vms: vms'] = function (t) {
 
             helpers.fillInRuleBlanks(res.rules, expRules);
             t.deepEqual(helpers.sortRes(res), {
+                remoteVMs: helpers.sortedUUIDs([ rvm1, rvm2 ]),
                 rules: clone(expRules).sort(helpers.uuidSort),
-                vms: [ vm1.uuid ].sort()
+                vms: [ vm1.uuid ]
             }, 'rules returned');
 
             zoneRules = helpers.defaultZoneRules(vm1.uuid);

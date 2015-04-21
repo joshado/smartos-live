@@ -3,6 +3,8 @@
 # All tests must pass!
 set -o errexit
 
+ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
 if [[ ! -f "/lib/sdc/.sdc-test-no-production-data" ]]; then
     cat <<EOF
 To run this test you must create the file:
@@ -36,11 +38,29 @@ if [[ -z "$1" ]]; then
     exit 1
 fi
 
+# Before starting tests, ensure we have the source(s) we want for test VM images
+
+have_sources="imgadm sources | sort"
+want_source="grep IMAGES_SOURCE ${ROOT}/common/vmtest.js | cut -d\' -f2"
+
+for src in $(comm -1 -3 <(eval ${have_sources}) <(eval ${want_source})); do
+    imgadm sources -a "${src}"
+done
+
+# Ensure images used by tests are installed
+
+installed_images='imgadm list -H -o uuid | sort'
+want_images="cat ${ROOT}/common/vmtest.js | grep exports\.CURRENT_.*_UUID | cut -d \"'\" -f2 | sort"
+
+for img in $(comm -1 -3 <(eval ${installed_images}) <(eval ${want_images})); do
+    imgadm import "${img}"
+done
+
 set +o errexit
 set -o pipefail
-export TAP=1
-NODE_PATH="/usr/vm/test/node-tap/node_modules:${NODE_PATH}" \
-    /usr/node/bin/node $1 | tee -a /tmp/test.output.$$
+/usr/node/bin/node --abort_on_uncaught_exception \
+    /usr/vm/node_modules/nodeunit/bin/nodeunit \
+    --reporter tap $1 | tee -a /tmp/test.output.$$
 TEST_EXIT_CODE=$?
 set +o pipefail
 set -o errexit

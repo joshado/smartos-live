@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Copyright (c) 2013 Joyent Inc., All rights reserved.
+# Copyright (c) 2015 Joyent Inc., All rights reserved.
 #
 # Output some info representing the system.  Default: JSON
 #
@@ -26,6 +26,7 @@ ZONENAME=$(zonename)
 FORCE=
 PARSABLE=
 UPDATE_ONLY=
+ZSTAT=
 
 while getopts fnpu? name
 do
@@ -102,11 +103,14 @@ function get_smbios_system_info()
 {
     # This puts the variables we're pulling out into the local environment
     eval $(smbios -t SMB_TYPE_SYSTEM | tr -d "\"" \
-        | egrep "Manufacturer: |Product: |Serial Number: |UUID: " \
+        | egrep "Manufacturer: |Product: |Serial Number: |UUID: |SKU Number: |Version: |Family: " \
         | sed -e 's/^ *//' \
-        | sed -e 's/: /="/' \
-        | sed -e 's/ *$/"/' \
-        | sed -e 's/Serial Number/Serial_Number/')
+        -e 's/: /="/' \
+        -e 's/ *$/"/' \
+        -e 's/Serial Number/Serial_Number/' \
+        -e 's/SKU Number/SKU_Number/' \
+        -e 's/Version/HW_Version/' \
+        -e 's/Family/HW_Family/')
 
     # overwrite UUID if config dictates otherwise
     tmp_uuid=$(/usr/bin/bootparams | grep "^override_uuid=" | cut -f2 -d'=')
@@ -220,11 +224,12 @@ function get_hostname()
 function get_zpool_disks()
 {
     local zpool=$1
+    local disks=$(/usr/bin/disklist -n)
+    ZSTAT=$(/usr/sbin/zpool status ${zpool} | awk '/[a-z]/{ print $1 }')
     Zpool_disks=
 
-    for disk in $(/usr/bin/disklist -n); do
-        local disk_in_pool=$(/usr/sbin/zpool status ${zpool} | grep ${disk})
-        if [[ -n ${disk_in_pool} ]]; then
+    for disk in ${disks}; do
+        if [[ "${ZSTAT}" =~ "${disk}" ]]; then
             Zpool_disks="${Zpool_disks},${disk}"
         fi
     done
@@ -239,7 +244,7 @@ function get_zpool_profile()
     Zpool_profile="striped"
 
     for profile in ${profiles[*]}; do
-        if [[ -n $(/usr/sbin/zpool status ${zpool} | grep ${profile}) ]]; then
+        if [[ "${ZSTAT}" =~ "${profile}" ]]; then
             Zpool_profile=${profile}
             break
         fi
@@ -279,20 +284,41 @@ function get_disks()
     IFS=$ORIGIFS
 }
 
+# grep through the appropriate networking config source for a parameter:
+# - boot-time file (used exclusively if present)
+# - bootparams
+# - usbkey config
+function net_conf_grep()
+{
+    if /usr/lib/sdc/net-boot-config --enabled; then
+        /usr/lib/sdc/net-boot-config | grep "$1"
+    else
+        /usr/bin/bootparams 2>/dev/null | grep "$1"
+        grep "$1" ${configfile} 2>/dev/null
+    fi
+}
+
 function get_aggregation_mappings()
 {
+    local aggr_name
     count=1
-    for line in $(/usr/bin/bootparams 2>/dev/null \
-        | grep "^[a-zA-Z0-9_]*_aggr=" \
-        ; grep "^[a-zA-Z0-9_]*_aggr=" ${configfile} 2>/dev/null); do
+    for line in $(net_conf_grep "^[a-zA-Z0-9_]*_aggr="); do
         fields=(${line//=/ })
         key=${fields[0]}
         val=${fields[1]}
 
-        Aggrs[${count}]=$(echo ${key} | sed -e 's/_aggr$//')
+        aggr_name=$(echo ${key} | sed -e 's/_aggr$//')
+        Aggrs[${count}]=$aggr_name
         macs=(${val//,/ })
         for mac in "${macs[@]}"; do
             normalize_mac ${mac}
+
+            if [[ -z ${AggrMacs[${aggr_name}]} ]]; then
+                AggrMacs[${aggr_name}]=${normalized}
+            else
+                AggrMacs[${aggr_name}]="${AggrMacs[${aggr_name}]},${normalized}"
+            fi
+
             if [[ -z ${AggrInterfaceList[${count}]} ]]; then
                 AggrInterfaceList[${count}]=${normalized}
             else
@@ -383,6 +409,13 @@ function get_smartos_network_interfaces()
         # list of interfaces that are actually on the aggr, rather than
         # what's defined in the config file
         if [[ -n ${port} ]]; then
+            # If a nic is in an aggregation, its MAC address in the output of
+            # `dladm show-phys -m` (used above) will be the MAC of the first
+            # port in the aggregation.  Correct that here, so sysinfo will
+            # still show the underlying nic's MAC.
+            normalize_mac $(echo ${mac} | sed 's/\|/:/g')
+            eval "Network_Interface_${port}_MAC_Address=${normalized}"
+
             ag_count=1
             for aggr in "${Aggrs[@]}"; do
                 if [[ "${aggr}" == "${iface}" ]]; then
@@ -469,6 +502,15 @@ function get_smartos_vnics()
     done
 }
 
+function get_overlay_nic_tags()
+{
+    if /usr/lib/sdc/net-boot-config --enabled; then
+        for line in $(/usr/lib/sdc/net-boot-config grep '_overlay_nic_tags_provided='); do
+            eval "CONFIG_${line}"
+        done
+    fi
+}
+
 function get_nic_tags()
 {
     NicTagCount=0
@@ -499,22 +541,19 @@ function get_aggr_params()
                 CompleteAggrs="${CompleteAggrs},${aggr}"
             fi
             CompleteAggrList[${c}]="Aggregation_${aggr}_Interfaces=${list}"
-            lacp_val=$(/usr/bin/bootparams | grep "^${aggr}_lacp_mode=" | cut -f2 -d'=')
-            if [[ -z ${lacp_val} ]] && [[ -f ${configfile} ]]; then
-                lacp_val=`grep "^${aggr}_lacp_mode=" ${configfile} | cut -f2- -d'='`
-            fi
 
+            lacp_val=$(net_conf_grep "^${aggr}_lacp_mode=" | tail -n 1 | cut -f2 -d'=')
             if [[ -z "${lacp_val}" ]]; then
                 lacp_val="off"
             fi
             eval "Aggregation_${aggr}_LACP_mode=${lacp_val}"
             eval "Aggregation_${aggr}_Interfaces=${list}"
+            eval "Aggregation_${aggr}_MACs=${AggrMacs[${aggr}]}"
 
             ((c++))
         fi
         ((ag++))
     done
-
 }
 
 function get_bootparams()
@@ -609,6 +648,9 @@ END
 Manufacturer='${Manufacturer}'
 Product='${Product}'
 Serial_Number='${Serial_Number}'
+SKU_Number='${SKU_Number}'
+HW_Version='${HW_Version}'
+HW_Family='${HW_Family}'
 VM_Capable='${VM_Capable}'
 CPU_Type='${CPU_Version}'
 CPU_Virtualization='${CPU_Virtualization}'
@@ -700,6 +742,8 @@ END
             lacp_var="Aggregation_${aggr}_LACP_mode"
             eval "lacp=\${${lacp_var}}"
             echo "${lacp_var}=${lacp}"
+
+            echo "Aggregation_${aggr}_MACs=${AggrMacs[${aggr}]}"
         done
     fi
 
@@ -738,6 +782,9 @@ END
   "Manufacturer": "${Manufacturer}",
   "Product": "${Product}",
   "Serial Number": "${Serial_Number}",
+  "SKU Number": "${SKU_Number}",
+  "HW Version": "${HW_Version}",
+  "HW Family": "${HW_Family}",
   "Setup": "${Setup_complete}",
   "VM Capable": ${VM_Capable},
   "CPU Type": "${CPU_Version}",
@@ -867,6 +914,7 @@ END
         eval "link_status=\${${link_status_var}}"
         eval "vlan=\${${vlan_var}}"
         eval "host=\${${host_var}}"
+        eval "overlay_nic_tags=\${CONFIG_${iface}_overlay_nic_tags_provided}"
 
         ((printed++))
         trailing_comma=","
@@ -877,6 +925,9 @@ END
         echo -n "\"Link Status\": \"${link_status}\", "
         if [[ ${ZONENAME} == "global" ]]; then
             echo -n "\"Host Interface\": \"${host}\", "
+        fi
+        if [[ -n $overlay_nic_tags ]]; then
+            echo -n "\"Overlay Nic Tags\": [ \"${overlay_nic_tags//,/\", }\" ], "
         fi
         echo -n "\"VLAN\": \"${vlan}\"}"
         echo "${trailing_comma}"
@@ -928,6 +979,7 @@ get_live_image_buildstamp
 get_system_type
 get_hostname
 get_aggregation_mappings
+get_overlay_nic_tags
 get_nic_tags
 get_smartos_network_interfaces
 get_smartos_vnics

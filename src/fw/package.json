@@ -1,12 +1,14 @@
 {
-  "name": "fwadm",
-  "description": "administrative tool for managing VM firewalls",
-  "version": "1.0.0",
+  "name": "fw",
+  "description": "Administrative tool for managing SmartOS VM firewalls",
+  "version": "1.1.1",
   "author": "Joyent (joyent.com)",
   "private": true,
+  "main": "./lib/fw.js",
   "devDependencies": {
     "mockery": "1.2.0",
-    "nodeunit": "git://github.com/rgulewich/nodeunit.git#80a3876"
+    "nodeunit": "0.8.6",
+    "ramsey": "0.1.2"
   },
   "dependencies": {
     "assert-plus": "0.1.2",
@@ -17,6 +19,7 @@
     "mkdirp": "0.3.4",
     "node-uuid": "1.2.0",
     "nopt": "1.0.10",
+    "tab": "0.1.0",
     "vasync": "1.3.2",
     "verror": "1.3.6"
   },

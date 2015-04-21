@@ -20,22 +20,27 @@
  *
  * CDDL HEADER END
  *
- * Copyright (c) 2013, Joyent, Inc. All rights reserved.
+ *
+ * Copyright (c) 2014, Joyent, Inc. All rights reserved.
+ *
  *
  * fwadm: Main entry points
  */
 
 var assert = require('assert-plus');
 var clone = require('clone');
+var filter = require('./filter');
 var fs = require('fs');
-var log = require('./util/log');
 var mkdirp = require('mkdirp');
 var mod_ipf = require('./ipf');
 var mod_obj = require('./util/obj');
+var mod_rvm = require('./rvm');
 var mod_rule = require('fwrule');
 var pipeline = require('./pipeline').pipeline;
 var sprintf = require('extsprintf').sprintf;
 var util = require('util');
+var util_err = require('./util/errors');
+var util_log = require('./util/log');
 var util_vm = require('./util/vm');
 var vasync = require('vasync');
 var verror = require('verror');
@@ -52,9 +57,7 @@ var mergeObjects = mod_obj.mergeObjects;
 
 
 var DIRECTIONS = ['from', 'to'];
-var LOG;
 var RULE_PATH = '/var/fw/rules';
-var VM_PATH = '/var/fw/vms';
 var IPF_CONF = '%s/config/ipf.conf';
 var IPF_CONF_OLD = '%s/config/ipf.conf.old';
 // VM fields that affect filtering
@@ -83,52 +86,11 @@ var VM_FIELDS_REQUIRED = [
 
 
 /**
- * Initialize the fw.js logger. This is intended to be called at every API
- * entry point.
+ * Assert that this is either a string or an object
  */
-function logEntry(opts, action) {
-    LOG = log.entry(opts, action);
-}
-
-
-/**
- * Creates a MultiError from an array of errors, or if there's only one in the
- * list, just returns that error.
- */
-function createMultiError(errs) {
-    if (errs.length == 1) {
-        return errs[0];
-    }
-
-    var details = [];
-    var err = new verror.MultiError(errs);
-
-    errs.forEach(function (e) {
-        if (e.hasOwnProperty('details')) {
-            details.push(e.details);
-        }
-    });
-
-    if (details.length !== 0) {
-        err.details = details;
-    }
-
-    return err;
-}
-
-
-/**
- * Adds to a 3-level deep object
- */
-function addToHash3(hash, key1, key2, key3, obj) {
-    if (!hash.hasOwnProperty(key1)) {
-        hash[key1] = {};
-    }
-    if (!hash[key1].hasOwnProperty(key2)) {
-        hash[key1][key2] = {};
-    }
-    if (!hash[key1][key2].hasOwnProperty(key3)) {
-        hash[key1][key2][key3] = obj;
+function assertStringOrObject(obj, name) {
+    if (typeof (obj) !== 'string' && typeof (obj) !== 'object') {
+        assert.ok(false, name + ' ([string] or [object]) required');
     }
 }
 
@@ -144,33 +106,6 @@ function noRulesNeeded(dir, rule) {
         return true;
     }
     return false;
-}
-
-
-/**
- * For each rule in rules, call cb for each target present in the rule,
- * passing the rule, target type and target itself.
- *
- * @param rules {Array} : rule objects to process
- * @param types {Array} : (optional)
- */
-function ruleTypeWalk(rules, types, cb) {
-    if (typeof (types) === 'function') {
-        cb = types;
-        types = ['ips', 'tags', 'vms', 'wildcards'];
-    }
-
-    rules.forEach(function (rule) {
-        types.forEach(function (type) {
-            rule[type].forEach(function (t) {
-                if (typeof (t) === 'string') {
-                    cb(rule, type, t);
-                } else {
-                    cb(rule, type, t[0], t[1]);
-                }
-            });
-        });
-    });
 }
 
 
@@ -217,14 +152,14 @@ function dedupRules(list1, list2) {
 /**
  * Starts ipf and reloads the rules for a VM
  */
-function startIPF(opts, callback) {
+function startIPF(opts, log, callback) {
     var ipfConf = util.format(IPF_CONF, opts.zonepath);
 
-    return mod_ipf.start(opts.vm, LOG, function (err) {
+    return mod_ipf.start(opts.vm, log, function (err) {
         if (err) {
             return callback(err);
         }
-        return mod_ipf.reload(opts.vm, ipfConf, LOG, callback);
+        return mod_ipf.reload(opts.vm, ipfConf, log, callback);
     });
 }
 
@@ -240,7 +175,13 @@ function startIPF(opts, callback) {
  */
 function validateOpts(opts) {
     assert.object(opts, 'opts');
-    assert.arrayOfObject(opts.vms, 'opts.vms');
+    assert.ok(util.isArray(opts.vms),
+        'opts.vms ([object]) required');
+    // Allow opts.vms to be empty - it's possible, though unlikely, that
+    // there are no VMs on this system
+    if (opts.vms.length !== 0) {
+        assert.arrayOfObject(opts.vms, 'opts.vms');
+    }
 }
 
 
@@ -248,12 +189,18 @@ function validateOpts(opts) {
  * Create rule objects from the rules
  *
  * @param {Array} inRules : raw rule input objects to create
- * @param {Function} callback : of the form f(err, newRules)
+ * @param {Function} callback : `f(err, newRules)`
+ * - newRules {Array} : array of rule objects
  */
-function createRules(inRules, callback) {
+function createRules(inRules, createdBy, callback) {
     var errors = [];
     var rules = [];
     var ver = mod_rule.generateVersion();
+
+    if (!callback) {
+        callback = createdBy;
+        createdBy = null;
+    }
 
     if (!inRules || inRules.length === 0) {
         return callback(null, []);
@@ -265,8 +212,12 @@ function createRules(inRules, callback) {
             rule.version = ver;
         }
 
+        if (createdBy && !rule.hasOwnProperty('created_by')) {
+            rule.created_by = createdBy;
+        }
+
         try {
-            var r = mod_rule.create(rule);
+            var r = mod_rule.create(rule, { enforceGlobal: true });
             rules.push(r);
         } catch (err) {
             errors.push(err);
@@ -274,7 +225,7 @@ function createRules(inRules, callback) {
     });
 
     if (errors.length !== 0) {
-        return callback(createMultiError(errors));
+        return callback(util_err.createMultiError(errors));
     }
 
     return callback(null, rules);
@@ -285,8 +236,8 @@ function createRules(inRules, callback) {
  * Merge updates from the rules in payload, and return the updated
  * rule objects
  */
-function createUpdatedRules(opts, callback) {
-    LOG.trace('createUpdatedRules: entry');
+function createUpdatedRules(opts, log, callback) {
+    log.trace('createUpdatedRules: entry');
     var originalRules = opts.originalRules;
     var updatedRules = opts.updatedRules;
 
@@ -294,8 +245,11 @@ function createUpdatedRules(opts, callback) {
         return callback(null, []);
     }
 
+    var mergedRule;
+    var origRule;
     var originals = {};
     var updated = [];
+    var ver = mod_rule.generateVersion();
 
     originalRules.forEach(function (r) {
         originals[r.uuid] = r;
@@ -304,14 +258,44 @@ function createUpdatedRules(opts, callback) {
     updatedRules.forEach(function (rule) {
         // Assume that we're allowed to do adds - findRules() would have errored
         // out if allowAdds was unset and an add was attempted
+        if (!rule.hasOwnProperty('version')) {
+            rule.version = ver;
+        }
+
+        if (opts.createdBy && !rule.hasOwnProperty('created_by')) {
+            rule.created_by = opts.createdBy;
+        }
+
         if (originals.hasOwnProperty(rule.uuid)) {
-            updated.push(mergeObjects(rule, originals[rule.uuid].serialize()));
+            origRule = originals[rule.uuid].serialize();
+            mergedRule = mergeObjects(rule, origRule);
+
+            if (!(rule.hasOwnProperty('owner_uuid')
+                && rule.hasOwnProperty('global'))) {
+                // If both owner_uuid and global are set - let
+                // this bubble up the appropriate error in createRules()
+
+                if (rule.hasOwnProperty('owner_uuid')
+                    && origRule.hasOwnProperty('global')) {
+                    // Updating from global -> owner_uuid rule
+                    delete mergedRule.global;
+                }
+
+                if (rule.hasOwnProperty('global')
+                    && origRule.hasOwnProperty('owner_uuid')) {
+                    // Updating from owner_uuid -> global rule
+                    delete mergedRule.owner_uuid;
+                }
+            }
+
+            updated.push(mergedRule);
+
         } else {
             updated.push(rule);
         }
     });
 
-    LOG.debug(updated, 'createUpdatedRules: rules merged');
+    log.debug(updated, 'createUpdatedRules: rules merged');
     return createRules(updated, callback);
 }
 
@@ -328,8 +312,8 @@ function createUpdatedRules(opts, callback) {
  *     ips: { 10.0.0.1: <vm 3> }
  *   }
  */
-function createVMlookup(vms, callback) {
-    LOG.trace('createVMlookup: entry');
+function createVMlookup(vms, log, callback) {
+    log.trace('createVMlookup: entry');
 
     var errs = [];
     var vmStore = {
@@ -337,6 +321,7 @@ function createVMlookup(vms, callback) {
         ips: {},
         subnets: {},
         tags: {},
+        tagValues: {},
         vms: {},
         wildcards: {}
     };
@@ -352,7 +337,7 @@ function createVMlookup(vms, callback) {
         });
 
         if (missing.length !== 0) {
-            LOG.error({ vm: fullVM, missing: missing }, 'missing VM fields');
+            log.error({ vm: fullVM, missing: missing }, 'missing VM fields');
             errs.push(new verror.VError(
                 'VM %s: missing field%s required for firewall: %s',
                 fullVM.uuid,
@@ -371,10 +356,10 @@ function createVMlookup(vms, callback) {
             uuid: fullVM.uuid,
             zonepath: fullVM.zonepath
         };
-        LOG.trace(vm, 'Adding VM "%s" to lookup', vm.uuid);
+        log.trace(vm, 'Adding VM "%s" to lookup', vm.uuid);
 
         vmStore.all[vm.uuid] = vm;
-        addToHash3(vmStore, 'vms', vm.uuid, vm.uuid, vm);
+        mod_obj.addToObj3(vmStore, 'vms', vm.uuid, vm.uuid, vm);
 
         forEachKey(vm.tags, function (tag, val) {
             createSubObjects(vmStore, 'tags', tag, vm.uuid, vm);
@@ -382,17 +367,17 @@ function createVMlookup(vms, callback) {
         });
 
         vm.ips.forEach(function (ip) {
-            addToHash3(vmStore, 'ips', ip, vm.uuid, vm);
+            mod_obj.addToObj3(vmStore, 'ips', ip, vm.uuid, vm);
         });
 
         // XXX: subnet
     });
 
     if (errs.length !== 0) {
-        return callback(createMultiError(errs));
+        return callback(util_err.createMultiError(errs));
     }
 
-    if (LOG.debug()) {
+    if (log.debug()) {
         var truncated = { };
         ['vms', 'tags', 'ips'].forEach(function (type) {
             truncated[type] = {};
@@ -405,7 +390,7 @@ function createVMlookup(vms, callback) {
             });
         });
 
-        LOG.debug(truncated, 'vmStore');
+        log.debug(truncated, 'vmStore');
     }
 
     return callback(null, vmStore);
@@ -415,81 +400,47 @@ function createVMlookup(vms, callback) {
 /**
  * Create a lookup table for remote VMs
  */
-function createRemoteVMlookup(remoteVMs, callback) {
-    LOG.trace('createRemoteVMlookup: entry');
-
-    var rvmLookup = {
-        all: {},
-        ips: {},
-        subnets: {},
-        tags: {},
-        vms: {},
-        wildcards: {}
-    };
-
-    if (!remoteVMs || objEmpty(remoteVMs)) {
-        return callback(null, rvmLookup);
-    }
-
-    var rvmList = remoteVMs;
-    if (!mod_obj.isArray(rvmList)) {
-        rvmList = [ remoteVMs ];
-    }
-
-    rvmList.forEach(function (rvmObj) {
-        forEachKey(rvmObj, function (uuid, rvm) {
-            // Make vms match the layout of tags, eg: tags[key][uuid] = { obj }
-            rvmLookup.vms[uuid] = {};
-            rvmLookup.vms[uuid][uuid] = rvm;
-
-            if (rvm.hasOwnProperty('tags')) {
-                forEachKey(rvm.tags, function (tag, val) {
-                    createSubObjects(rvmLookup.tags, tag, uuid, rvm);
-                    createSubObjects(rvmLookup, 'tagValues', tag, val,
-                        uuid, rvm);
-                });
-            }
-
-            rvm.ips.forEach(function (ip) {
-                addToHash3(rvmLookup, 'ips', ip, uuid, rvm);
-            });
-
-            rvmLookup.all[uuid] = rvm;
-        });
-    });
-
-    rvmLookup.wildcards.vmall = rvmLookup.all;
-    return callback(null, rvmLookup);
+function createRemoteVMlookup(remoteVMs, log, callback) {
+    return callback(null, mod_rvm.createLookup(remoteVMs, log));
 }
 
 
 /**
  * Load a single rule from disk, returning a rule object
  *
- * @param {String} file : file to load the rule from
- * @param {Function} callback : of the form f(err, rule)
- * - Where vm is a rule object
+ * @param {String} uuid : UUID of the rule to load
+ * @param {Function} callback : `f(err, rule)`
+ * - vm {Object} : rule object (as per mod_rule)
  */
-function loadRule(file, callback) {
-    LOG.debug('loadRule: loading rule file "%s"', file);
+function loadRule(uuid, log, callback) {
+    var file = util.format('%s/%s.json', RULE_PATH, uuid);
+    log.debug('loadRule: loading rule file "%s"', file);
+
     return fs.readFile(file, function (err, raw) {
         if (err) {
+            if (err.code == 'ENOENT') {
+                var uErr = new verror.VError('Unknown rule "%s"', uuid);
+                uErr.code = 'ENOENT';
+                return callback(uErr);
+            }
+
             return callback(err);
         }
+
         var rule;
 
         try {
             var parsed = JSON.parse(raw);
-            LOG.trace(parsed, 'loadRule: loaded rule file "%s"', file);
+            log.trace(parsed, 'loadRule: loaded rule file "%s"', file);
             // XXX: validate that the rule has a uuid
             rule = mod_rule.create(parsed);
         } catch (err2) {
-            LOG.error(err2, 'loadRule: error creating rule');
+            log.error(err2, 'loadRule: error creating rule');
             return callback(err2);
         }
 
-        if (LOG.trace()) {
-            LOG.trace(rule.toString(), 'loadRule: created rule');
+        if (log.trace()) {
+            log.trace(rule.toString(), 'loadRule: created rule');
         }
 
         return callback(null, rule);
@@ -500,7 +451,7 @@ function loadRule(file, callback) {
 /**
  * Loads all rules from disk
  */
-function loadAllRules(callback) {
+function loadAllRules(log, callback) {
     var rules = [];
 
     fs.readdir(RULE_PATH, function (err, files) {
@@ -518,8 +469,8 @@ function loadAllRules(callback) {
                     return cb(null);
                 }
 
-                var rpath = util.format('%s/%s', RULE_PATH, file);
-                return loadRule(rpath, function (err2, rule) {
+                return loadRule(file.substring(0, file.length - 5),
+                    log, function (err2, rule) {
                     if (rule) {
                         rules.push(rule);
                     }
@@ -528,11 +479,11 @@ function loadAllRules(callback) {
             }
         }, function (err3, res) {
             if (err3) {
-                LOG.error(err3, 'loadAllRules: return');
+                log.error(err3, 'loadAllRules: return');
                 return callback(err3);
             }
 
-            LOG.debug({ fullRules: rules }, 'loadAllRules: return');
+            log.debug({ fullRules: rules }, 'loadAllRules: return');
             return callback(null, rules);
         });
     });
@@ -543,12 +494,12 @@ function loadAllRules(callback) {
  * Saves rules to disk
  *
  * @param {Array} rules : rule objects to save
- * @param {Function} callback : of the form f(err)
+ * @param {Function} callback : `f(err)`
  */
-function saveRules(rules, callback) {
+function saveRules(rules, log, callback) {
     var uuids = [];
     var versions = {};
-    LOG.debug({ rules: rules }, 'saveRules: entry');
+    log.debug({ rules: rules }, 'saveRules: entry');
 
     return vasync.pipeline({
     funcs: [
@@ -561,7 +512,7 @@ function saveRules(rules, callback) {
                     // XXX: allow overriding version in the payload
                     var filename = util.format('%s/%s.json.%s', RULE_PATH,
                         rule.uuid, rule.version);
-                    LOG.trace(ser, 'writing "%s"', filename);
+                    log.trace(ser, 'writing "%s"', filename);
 
                     return fs.writeFile(filename, JSON.stringify(ser, null, 2),
                         function (err) {
@@ -584,7 +535,7 @@ function saveRules(rules, callback) {
                     var before = util.format('%s/%s.json.%s', RULE_PATH, uuid,
                         versions[uuid]);
                     var after = util.format('%s/%s.json', RULE_PATH, uuid);
-                    LOG.trace('renaming "%s" to "%s"', before, after);
+                    log.trace('renaming "%s" to "%s"', before, after);
                     fs.rename(before, after, cb2);
                 }
             }, cb);
@@ -597,16 +548,16 @@ function saveRules(rules, callback) {
  * Deletes rules on disk
  *
  * @param {Array} rules : rule objects to delete
- * @param {Function} callback : of the form f(err)
+ * @param {Function} callback : `f(err)`
  */
-function deleteRules(rules, callback) {
-    LOG.debug({ rules: rules }, 'deleteRules: entry');
+function deleteRules(rules, log, callback) {
+    log.debug({ rules: rules }, 'deleteRules: entry');
 
     return vasync.forEachParallel({
         inputs: rules.map(function (r) { return r.uuid; }),
         func: function _delRule(uuid, cb) {
             var filename = util.format('%s/%s.json', RULE_PATH, uuid);
-            LOG.trace('deleting "%s"', filename);
+            log.trace('deleting "%s"', filename);
 
             fs.unlink(filename, function (err) {
                 if (err && err.code == 'ENOENT') {
@@ -621,150 +572,15 @@ function deleteRules(rules, callback) {
 
 
 /**
- * Load a single remote VM from disk, returning the object
- *
- * @param {String} file : file to load the remote VM from
- * @param {Function} callback : of the form f(err, vm)
- * - Where vm is a remote VM object
- */
-function loadRemoteVM(file, callback) {
-    LOG.trace('loadRemoteVM: loading file "%s"', file);
-
-    return fs.readFile(file, function (err, raw) {
-        if (err) {
-            return callback(err);
-        }
-        var parsed;
-
-        try {
-            parsed = JSON.parse(raw);
-            LOG.trace(parsed, 'loadRemoteVM: loaded rule file "%s"', file);
-            // XXX: validate that the VM has a uuid
-        } catch (err2) {
-            LOG.error(err2, 'loadRemoteVM: error parsing VM file "%s"', file);
-            return callback(err2);
-        }
-
-        if (LOG.trace()) {
-            LOG.trace(parsed, 'loadRemoteVM: created rule');
-        }
-
-        return callback(null, parsed);
-    });
-}
-
-
-/**
- * Loads all remote VMs from disk
- *
- * @param {Function} callback : of the form f(err, vms)
- * - Where vms is an object containing the remote VMs, keyed by UUID
- */
-function loadAllRemoteVMs(callback) {
-    var vms = {};
-
-    fs.readdir(VM_PATH, function (err, files) {
-        if (err) {
-            if (err.code === 'ENOENT') {
-                return callback(null, {});
-            }
-            return callback(err);
-        }
-
-        return vasync.forEachParallel({
-            inputs: files,
-            func: function (file, cb) {
-                if (file.indexOf('.json', file.length - 5) === -1) {
-                    return cb(null);
-                }
-                var uuid = file.split('.')[0];
-
-                var path = util.format('%s/%s', VM_PATH, file);
-                return loadRemoteVM(path, function (err2, rvm) {
-                    if (rvm) {
-                        vms[uuid] = rvm;
-                    }
-                    return cb(err2);
-                });
-            }
-        }, function (err3, res) {
-            return callback(err3, vms);
-        });
-    });
-}
-
-
-/*
- * Saves remote VMs to disk
- *
- * @param {Object} vms : remote VM objects to save, keyed by UUID
- * @param {Function} callback : of the form f(err)
- */
-function saveRemoteVMs(vms, callback) {
-    LOG.trace('saveRemoteVMs: entry');
-
-    if (!vms || objEmpty(vms)) {
-        return callback();
-    }
-
-    var uuids = [];
-    // XXX: allow overriding version in the payload
-    var versions = {};
-    var ver = mod_rule.generateVersion();
-
-    return vasync.pipeline({
-    funcs: [
-        function _mkdir(_, cb) { mkdirp(VM_PATH, cb); },
-        function _writeVMs(_, cb) {
-            return vasync.forEachParallel({
-                inputs: Object.keys(vms),
-                func: function _writeVM(uuid, cb2) {
-                    var vm = vms[uuid];
-                    var filename = util.format('%s/%s.json.%s',
-                        VM_PATH, uuid, ver);
-                    LOG.trace(vm, 'writing "%s"', filename);
-
-                    return fs.writeFile(filename, JSON.stringify(vm, null, 2),
-                        function (err) {
-                        if (err) {
-                            return cb2(err);
-                        }
-
-                        uuids.push(uuid);
-                        versions[uuid] = ver;
-
-                        return cb2(null);
-                    });
-                }
-            // XXX: if there are failures here, we want to delete these files
-            }, cb);
-        },
-        function _renameRules(_, cb) {
-            return vasync.forEachParallel({
-                inputs: uuids,
-                func: function _renameRule(uuid, cb2) {
-                    var before = util.format('%s/%s.json.%s', VM_PATH, uuid,
-                        versions[uuid]);
-                    var after = util.format('%s/%s.json', VM_PATH, uuid);
-                    LOG.trace('renaming "%s" to "%s"', before, after);
-                    fs.rename(before, after, cb2);
-                }
-            }, cb);
-        }
-    ]}, callback);
-}
-
-
-/**
  * Loads rules and remote VMs from disk
  */
-function loadDataFromDisk(callback) {
+function loadDataFromDisk(log, callback) {
     var onDisk = {};
 
     vasync.parallel({
         funcs: [
             function _diskRules(cb) {
-                loadAllRules(function (err, res) {
+                loadAllRules(log, function (err, res) {
                     if (res) {
                         onDisk.rules = res;
                     }
@@ -774,7 +590,7 @@ function loadDataFromDisk(callback) {
             },
 
             function _diskRemoteVMs(cb) {
-                loadAllRemoteVMs(function (err, res) {
+                mod_rvm.loadAll(log, function (err, res) {
                     if (res) {
                         onDisk.remoteVMs = res;
                     }
@@ -796,8 +612,8 @@ function loadDataFromDisk(callback) {
 /**
  * Finds rules in the list, returning an error if they can't be found
  */
-function findRules(opts, callback) {
-    LOG.trace('findRules: entry');
+function findRules(opts, log, callback) {
+    log.trace('findRules: entry');
     var allowAdds = opts.allowAdds || false;
     var allRules = opts.allRules;
     var rules = opts.rules;
@@ -816,7 +632,7 @@ function findRules(opts, callback) {
         }
         uuids[r.uuid] = 1;
     });
-    LOG.debug(uuids, 'findRules: rules');
+    log.debug(uuids, 'findRules: rules');
 
     allRules.forEach(function (r) {
         if (!r.hasOwnProperty('uuid')) {
@@ -836,18 +652,18 @@ function findRules(opts, callback) {
         });
     }
 
-    if (LOG.debug()) {
+    if (log.debug()) {
         var ret = { rules: found };
         if (allowAdds) {
             ret.adds = Object.keys(uuids);
         } else {
             ret.missing = Object.keys(uuids);
         }
-        LOG.debug(ret, 'findRules: return');
+        log.debug(ret, 'findRules: return');
     }
 
     if (errs.length !== 0) {
-        return callback(createMultiError(errs));
+        return callback(util_err.createMultiError(errs));
     }
 
     return callback(null, found);
@@ -855,222 +671,14 @@ function findRules(opts, callback) {
 
 
 /**
- * Returns an object of the VMs the given rules apply to
- *
- * @param vms {Object}: VM lookup table, as returned by createVMlookup()
- * @param rules {Array}: array of rule objects
- * @param callback {Function} `function (err, matchingVMs)`
- * - Where matchingVMs contains VM objects keyed by uuid, like:
- *     { vm_uuid: vmObj }
- */
-function filterVMsByRules(vms, rules, callback) {
-    LOG.debug({ rules: rules }, 'filterVMsByRules: entry');
-    var matchingVMs = {};
-
-    ruleTypeWalk(rules, function _matchingVMs(rule, type, t, val) {
-        if (val !== undefined) {
-            type = 'tagValues';
-        }
-
-        if (type === 'wildcards' && t === 'any') {
-            return;
-        }
-
-        if (!vms[type].hasOwnProperty(t)) {
-            LOG.debug(
-                'filterVMsByRules: type=%s, t=%s, rule=%s: not in VM hash',
-                type, t, rule);
-            return;
-        }
-
-        var vmList = vms[type][t];
-        if (val) {
-            if (!vms[type][t].hasOwnProperty(val)) {
-                return;
-            }
-            vmList = vms[type][t][val];
-        }
-
-        var owner_uuid = rule.owner_uuid;
-
-        Object.keys(vmList).forEach(function (uuid) {
-            var vm = vmList[uuid];
-            if (owner_uuid && vm.owner_uuid != owner_uuid) {
-                LOG.debug(
-                    'filterVMsByRules: type=%s, t=%s, VM=%s: rule owner uuid'
-                    + ' (%s) did not match VM owner uuid (%s): %s',
-                    type, t, uuid, owner_uuid, vm.owner_uuid, rule);
-                return;
-            }
-            LOG.debug(
-                'filterVMsByRules: type=%s, t=%s, VM=%s: matched rule: %s',
-                type, t, uuid, rule);
-            matchingVMs[uuid] = vm;
-        });
-    });
-
-    LOG.debug({ vms: matchingVMs }, 'filterVMsByRules: return');
-    return callback(null, matchingVMs);
-}
-
-
-/**
- * Filter the list of rules, returning only the rules that contain VMs
- * in the given remote VM lookup table
- *
- * @param remoteVMs {Object}: remote VM lookup table, as returned by
- *  createRemoteVMlookup()
- * @param rules {Array}: array of rule objects
- * @param callback {Function} `function (err, matchingRules)`
- *
- */
-function filterRulesByRemoteVMs(remoteVMs, rules, callback) {
-    LOG.trace('filterRulesByRemoteVMs: entry');
-
-    if (!remoteVMs || objEmpty(remoteVMs)) {
-        return callback(null, []);
-    }
-
-    var matchingRules = [];
-
-    ruleTypeWalk(rules, ['tags', 'vms', 'wildcards'], function (rule, type, t) {
-        if (type === 'wildcards' && t === 'any') {
-            return;
-        }
-
-        if (remoteVMs[type].hasOwnProperty(t)) {
-            if (!rule.hasOwnProperty('owner_uuid')) {
-                matchingRules.push(rule);
-                return;
-            }
-
-            for (var uuid in remoteVMs[type][t]) {
-                if (remoteVMs[type][t][uuid].owner_uuid == rule.owner_uuid) {
-                    matchingRules.push(rule);
-                    return;
-                }
-            }
-        }
-        return;
-    });
-
-    LOG.debug({ rules: matchingRules }, 'filterRulesByRemoteVMs: return');
-    return callback(null, matchingRules);
-}
-
-
-/**
- * Find rules that match a set of UUIDs. Warns if any of the UUIDs can't be
- * found.
- *
- * @param rules {Array} : list of rules to filter
- * @param uuids {Array} : UUIDs of rules to filter
- * @param callback {Function} : `function (err, rules)`
- * - Where matching is an object:
- *     { matching: [ <rules> ], notMatching: [ <rules> ] }
- */
-function filterRulesByUUIDs(rules, uuids, callback) {
-    LOG.debug(uuids, 'filterRulesByUUIDs: entry');
-    var results = {
-        matching: [],
-        notMatching: []
-    };
-    var uuidHash = uuids.reduce(function (acc, u) {
-        acc[u] = 1;
-        return acc;
-    }, {});
-
-    rules.forEach(function (rule) {
-        if (uuidHash.hasOwnProperty(rule.uuid)) {
-            delete uuidHash[rule.uuid];
-            results.matching.push(rule);
-        } else {
-            results.notMatching.push(rule);
-        }
-    });
-
-    if (!objEmpty(uuidHash)) {
-        LOG.warn(Object.keys(uuidHash), 'Trying to delete unknown rules');
-    }
-
-    LOG.debug({ rules: results.matching }, 'filterRulesByUUIDs: return');
-    return callback(null, results);
-}
-
-
-/**
- * Find rules that apply to a set of VMs
- *
- * @param allVMs {Object} : VM lookup table
- * @param vms {Object} : hash of VM UUIDs to find rules for
- * - e.g. : { uuid1: 1, uuid2: 2 }
- * @param rules {Array} : list of rules to filter
- * @param callback {Function} : `function (err, matching)`
- * - Where matching is an array of the matching rule objects
- */
-function filterRulesByVMs(allVMs, vms, rules, callback) {
-    LOG.debug({ vms: vms }, 'filterRulesByVMs: entry');
-    var matchingRules = [];
-    var matchingUUIDs = {};
-
-    ruleTypeWalk(rules, function _filterByVM(rule, type, t, val) {
-        if (val !== undefined) {
-            type = 'tagValues';
-        }
-
-        LOG.trace('filterRulesByVMs: type=%s, t=%s, rule=%s',
-            type, t, rule);
-
-        if (!allVMs[type].hasOwnProperty(t)) {
-            return;
-        }
-
-        var vmList = allVMs[type][t];
-
-        if (val) {
-            if (!allVMs[type][t].hasOwnProperty(val)) {
-                return;
-            }
-            vmList = allVMs[type][t][val];
-        }
-
-        var owner_uuid = rule.owner_uuid;
-
-        for (var uuid in vmList) {
-            if (!vms.hasOwnProperty(uuid)) {
-                continue;
-            }
-
-            if (owner_uuid && vmList[uuid].owner_uuid != owner_uuid) {
-                LOG.trace('filterRulesByVMs: VM %s owner_uuid=%s does not match'
-                    + ' rule owner_uuid=%s: %s', vmList[uuid].owner_uuid,
-                    owner_uuid, rule);
-                continue;
-            }
-
-            if (!matchingUUIDs[rule.uuid]) {
-                matchingRules.push(rule);
-                matchingUUIDs[rule.uuid] = true;
-            }
-
-            return;
-        }
-    });
-
-    LOG.debug({ rules: matchingRules }, 'filterRulesByVMs: return');
-    return callback(null, matchingRules);
-}
-
-
-/**
  * Looks up the given VMs in the VM lookup object, and returns an
  * object mapping UUIDs to VM lookup objects
  */
-function lookupVMs(allVMs, vms, callback) {
-    LOG.debug({ vms: vms }, 'lookupVMs: entry');
+function lookupVMs(allVMs, vms, log, callback) {
+    log.debug({ vms: vms }, 'lookupVMs: entry');
 
     if (!vms || vms.length === 0) {
-        LOG.debug('lookupVMs: no VMs to lookup: returning');
+        log.debug('lookupVMs: no VMs to lookup: returning');
         return callback(null, {});
     }
 
@@ -1090,10 +698,10 @@ function lookupVMs(allVMs, vms, callback) {
     });
 
     if (errs.length !== 0) {
-        return callback(createMultiError(errs));
+        return callback(util_err.createMultiError(errs));
     }
 
-    LOG.debug({ vms: toReturn }, 'lookupVMs: return');
+    log.debug({ vms: toReturn }, 'lookupVMs: return');
     return callback(null, toReturn);
 }
 
@@ -1104,12 +712,12 @@ function lookupVMs(allVMs, vms, callback) {
  *
  * @param vms {Object}: VM lookup table, as returned by createVMlookup()
  * @param rvms {Object}: remote VM lookup table, as returned by
- *  createRemoteVMlookup()
+ *     createRemoteVMlookup()
  * @param rules {Array}: array of rule objects
  * @param callback {Function} `function (err)`
  */
-function validateRules(vms, rvms, rules, callback) {
-    LOG.trace(rules, 'validateRules: entry');
+function validateRules(vms, rvms, rules, log, callback) {
+    log.trace(rules, 'validateRules: entry');
     var sideData = {};
     var errs = [];
     var rulesLeft = rules.reduce(function (h, r) {
@@ -1119,10 +727,18 @@ function validateRules(vms, rvms, rules, callback) {
 
     // XXX: make owner uuid aware
 
-    // First go through the rules finding all the VMs we need rules for
+    // First go through the rules finding all the VMs we need rules for,
+    // and mark any missing types
     ruleTypeDirWalk(rules, function _getRuleData(rule, dir, type, t) {
-        // XXX: for now
+        // Don't bother checking IPs, since we don't need any additional
+        // data in order to create an ipf rule
         if (type == 'ips') {
+            return;
+        }
+
+        // Allow creating rules that target tags, but not any specific VMs
+        if (type == 'tags') {
+            delete rulesLeft[rule.uuid];
             return;
         }
 
@@ -1136,8 +752,8 @@ function validateRules(vms, rvms, rules, callback) {
             delete rulesLeft[rule.uuid];
 
         } else if (rvms[type].hasOwnProperty(t)) {
-
             delete rulesLeft[rule.uuid];
+
         } else {
             sideData[rule.uuid][dir].missing[type][t] = 1;
         }
@@ -1150,6 +766,10 @@ function validateRules(vms, rvms, rules, callback) {
 
     rules.forEach(function (rule) {
         var missing = sideData[rule.uuid];
+
+        if (!missing) {
+            return;
+        }
 
         DIRECTIONS.forEach(function (dir) {
             var otherSide = (dir == 'to' ? 'from' : 'to');
@@ -1169,7 +789,7 @@ function validateRules(vms, rvms, rules, callback) {
     });
 
     if (errs.length !== 0) {
-        return callback(createMultiError(errs));
+        return callback(util_err.createMultiError(errs));
     }
 
     return callback();
@@ -1263,14 +883,14 @@ function ipfRuleObj(opts) {
  *   config minus the rule that no longer applies.
  * @param callback {Function} `function (err)`
  */
-function prepareIPFdata(opts, callback) {
+function prepareIPFdata(opts, log, callback) {
     var allVMs = opts.allVMs;
     var date = new Date();
     var rules = opts.rules;
     var vms = opts.vms;
     var remoteVMs = opts.remoteVMs || { ips: {}, vms: {}, tags: {} };
 
-    LOG.debug({ vms: vms, rules: rules }, 'prepareIPFdata: entry');
+    log.debug({ vms: vms, rules: rules }, 'prepareIPFdata: entry');
 
     var conf = {};
     if (vms) {
@@ -1290,8 +910,8 @@ function prepareIPFdata(opts, callback) {
         }
 
         var ruleVMs = {
-            from: vmsOnSide(allVMs, rule, 'from'),
-            to: vmsOnSide(allVMs, rule, 'to')
+            from: vmsOnSide(allVMs, rule, 'from', log),
+            to: vmsOnSide(allVMs, rule, 'to', log)
         };
 
         DIRECTIONS.forEach(function (dir) {
@@ -1351,7 +971,7 @@ function prepareIPFdata(opts, callback) {
             });
         });
 
-        LOG.debug(rulesIncluded, 'VM %s: generated ipf.conf', vm);
+        log.debug(rulesIncluded, 'VM %s: generated ipf.conf', vm);
 
         toReturn.files[filename] = ipfConf.concat([
             '',
@@ -1372,7 +992,7 @@ function prepareIPFdata(opts, callback) {
 /**
  * Returns an array of the UUIDs of VMs on the given side of a rule
  */
-function vmsOnSide(allVMs, rule, dir) {
+function vmsOnSide(allVMs, rule, dir, log) {
     var matching = [];
 
     ['vms', 'tags', 'wildcards'].forEach(function (type) {
@@ -1389,7 +1009,7 @@ function vmsOnSide(allVMs, rule, dir) {
             }
 
             if (!allVMs[type] || !allVMs[type].hasOwnProperty(t)) {
-                LOG.debug('No matching VMs found in lookup for %s=%s', type, t);
+                log.debug('No matching VMs found in lookup for %s=%s', type, t);
                 return;
             }
 
@@ -1503,9 +1123,75 @@ function rulesFromOtherSide(rule, dir, localVMs, remoteVMs) {
 
 
 /**
+ * Gets remote targets from the other side of the rule and adds them to
+ * the targets object
+ */
+function addOtherSideRemoteTargets(vms, rule, targets, dir, log) {
+    var matching = vmsOnSide(vms, rule, dir, log);
+    if (matching.length === 0) {
+        return;
+    }
+
+    var otherSide = dir === 'from' ? 'to' : 'from';
+    if (rule[otherSide].tags.length !== 0) {
+        if (!targets.hasOwnProperty('tags')) {
+            targets.tags = {};
+        }
+
+        // All tags (no value) wins out over tags with
+        // a value. If multiple values for the same tag
+        // are present, return them as an array
+        rule[otherSide].tags.forEach(function (tag) {
+            var key = tag;
+            var val = true;
+            if (typeof (tag) !== 'string') {
+                key = tag[0];
+                val = tag[1];
+            }
+
+            if (!targets.tags.hasOwnProperty(key)) {
+                targets.tags[key] = val;
+            } else {
+                if (targets.tags[key] !== true) {
+                    if (val === true) {
+                        targets.tags[key] = val;
+                    } else {
+                        if (!util.isArray(targets.tags[key])) {
+                            targets.tags[key] = [ targets.tags[key] ];
+                        }
+
+                        if (targets.tags[key].indexOf(val) === -1) {
+                            targets.tags[key].push(val);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    if (rule[otherSide].vms.length !== 0) {
+        if (!targets.hasOwnProperty('vms')) {
+            targets.vms = {};
+        }
+
+        rule[otherSide].vms.forEach(function (vm) {
+            // Don't add if it's a local VM
+            if (!vms.all.hasOwnProperty(vm)) {
+                targets.vms[vm] = true;
+            }
+        });
+    }
+
+    if (rule[otherSide].wildcards.indexOf('vmall') !== -1) {
+        targets.allVMs = true;
+    }
+}
+
+
+/**
  * Saves all of the files in ipfData to disk
  */
-function saveIPFfiles(ipfData, callback) {
+function saveIPFfiles(ipfData, log, callback) {
     var ver = Date.now(0) + '.' + sprintf('%06d', process.pid);
 
     return vasync.forEachParallel({
@@ -1517,7 +1203,7 @@ function saveIPFfiles(ipfData, callback) {
             vasync.pipeline({
             funcs: [
                 function _write(_, cb2) {
-                    LOG.trace('saveIPFfiles: writing temp file "%s"', tempFile);
+                    log.trace('saveIPFfiles: writing temp file "%s"', tempFile);
                     return fs.writeFile(tempFile, ipfData[file], cb2);
                 },
                 function _renameOld(_, cb2) {
@@ -1548,27 +1234,27 @@ function saveIPFfiles(ipfData, callback) {
  * @param callback {Function} `function (err, restarted)`
  * - Where restarted is a list of UUIDs for VMs that were actually restarted
  */
-function restartFirewalls(vms, uuids, callback) {
-    LOG.trace(uuids, 'restartFirewalls: entry');
+function restartFirewalls(vms, uuids, log, callback) {
+    log.trace(uuids, 'restartFirewalls: entry');
     var restarted = [];
 
     return vasync.forEachParallel({
         inputs: uuids,
         func: function _restart(uuid, cb) {
             if (!vms.all[uuid].enabled || vms.all[uuid].state !== 'running') {
-                LOG.debug('restartFirewalls: VM "%s": not restarting '
+                log.debug('restartFirewalls: VM "%s": not restarting '
                     + '(enabled=%s, state=%s)', uuid, vms.all[uuid].enabled,
                     vms.all[uuid].state);
                 return cb(null);
             }
 
-            LOG.debug('restartFirewalls: reloading firewall for VM "%s" '
+            log.debug('restartFirewalls: reloading firewall for VM "%s" '
                 + '(enabled=%s, state=%s)', uuid, vms.all[uuid].enabled,
                 vms.all[uuid].state);
 
             // Start the firewall just in case
             return startIPF({ vm: uuid, zonepath: vms.all[uuid].zonepath },
-                function (err) {
+                log, function (err) {
                     restarted.push(uuid);
                     return cb(err);
                 });
@@ -1581,61 +1267,34 @@ function restartFirewalls(vms, uuids, callback) {
 
 
 /**
- * Create remote VM objects
- *
- * @param allVMs {Object}: VM lookup table, as returned by createVMlookup()
- * @param vms {Array}: array of VM objects to turn into remote VMs
- * @param callback {Function} `function (err, remoteVMs)`
- * - Where remoteVMs is an object of remote VMs, keyed by UUID
- */
-function createRemoteVMs(allVMs, vms, callback) {
-    LOG.trace(vms, 'createRemoteVMs: entry');
-    if (!vms || vms.length === 0) {
-        return callback();
-    }
-
-    var remoteVMs = {};
-    var errs = [];
-
-    vms.forEach(function (vm) {
-        try {
-            var rvm = util_vm.createRemoteVM(vm);
-            if (allVMs.all.hasOwnProperty(rvm.uuid)) {
-                var err = new verror.VError(
-                    'Remote VM "%s" must not have the same UUID as a local VM',
-                    rvm.uuid);
-                err.details = vm;
-                throw err;
-            }
-            remoteVMs[rvm.uuid] = rvm;
-        } catch (err2) {
-            errs.push(err2);
-        }
-    });
-
-    if (errs.length !== 0) {
-        return callback(createMultiError(errs));
-    }
-
-    return callback(null, remoteVMs);
-}
-
-
-/**
  * Applies firewall changes:
  * - saves / deletes rule files as needed
  * - writes out ipf conf files
  * - starts or restarts ipf in VMs
- *   - allVMs {Array of Objects} : all local VMs
- *   - vms {Object} : Mapping of UUID to VM object - VMs to write out
- *     firewalls for
  *
- * @param {Object} opts : options
+ * @param {Object} opts :
+ *   - allRemoteVMs {Object} : VM lookup object of all remote VMs
+ *   - allVMs {Object} : VM lookup object of all local VMs
+ *   - del {Object} : Objects to delete from disk:
+ *     - rules {Array of Objects} : rules objects to delete
+ *     - rvms {Array of Objects} : remote VM UUIDs to delete
+ *   - dryRun {Bool} : if true, no files will be written or firewalls reloaded
+ *   - rules {Array of Objects} : rules to write out
+ *   - save {Object} : Objects to save to disk:
+ *     - rules {Array of Objects} : rule objects to save
+ *     - remoteVMs {Array of Objects} : remote VM objects to save
+ *   - vms {Object} : Mapping of UUID to VM object - VMs to write out
+ *     firewalls for, regardless of whether or not rules affect them
+ *     (necessary for catching the case where a VM used to have rules that
+ *     applied to it but no longer does)
  */
-function applyChanges(opts, callback) {
+function applyChanges(opts, log, callback) {
+    log.trace(opts, 'applyChanges: entry');
+
     assert.object(opts, 'opts');
-    assert.optionalObject(opts.allVMs, 'opts.allVMs');
     assert.optionalObject(opts.allRemoteVMs, 'opts.allRemoteVMs');
+    assert.optionalObject(opts.allVMs, 'opts.allVMs');
+    assert.optionalObject(opts.del, 'opts.del');
     assert.optionalArrayOfObject(opts.rules, 'opts.rules');
     assert.optionalObject(opts.vms, 'opts.vms');
     assert.optionalObject(opts.save, 'opts.save');
@@ -1649,7 +1308,7 @@ function applyChanges(opts, callback) {
                 remoteVMs: opts.allRemoteVMs,
                 rules: opts.rules,
                 vms: opts.vms
-            }, cb);
+            }, log, cb);
         },
 
         // Save the remote VMs
@@ -1658,7 +1317,7 @@ function applyChanges(opts, callback) {
                 || objEmpty(opts.save.remoteVMs)) {
                 return cb(null);
             }
-            saveRemoteVMs(opts.save.remoteVMs, cb);
+            mod_rvm.save(opts.save.remoteVMs, log, cb);
         },
 
         // Save rule files (if specified)
@@ -1667,7 +1326,7 @@ function applyChanges(opts, callback) {
                 || opts.save.rules.length === 0) {
                 return cb(null);
             }
-            saveRules(opts.save.rules, cb);
+            saveRules(opts.save.rules, log, cb);
         },
 
         // Delete rule files (if specified)
@@ -1676,7 +1335,16 @@ function applyChanges(opts, callback) {
                 || opts.del.rules.length === 0) {
                 return cb(null);
             }
-            deleteRules(opts.del.rules, cb);
+            deleteRules(opts.del.rules, log, cb);
+        },
+
+        // Delete remote VMs (if specified)
+        function delRVMs(res, cb) {
+            if (opts.dryrun || !opts.del || !opts.del.rvms
+                || opts.del.rvms.length === 0) {
+                return cb(null);
+            }
+            mod_rvm.del(opts.del.rvms, log, cb);
         },
 
         // Write the new ipf files to disk
@@ -1684,7 +1352,7 @@ function applyChanges(opts, callback) {
             if (opts.dryrun) {
                 return cb(null);
             }
-            saveIPFfiles(res.ipfData.files, cb);
+            saveIPFfiles(res.ipfData.files, log, cb);
         },
 
         // Restart the firewalls for all of the affected VMs
@@ -1692,7 +1360,7 @@ function applyChanges(opts, callback) {
             if (opts.dryrun) {
                 return cb(null);
             }
-            restartFirewalls(opts.allVMs, res.ipfData.vms, cb);
+            restartFirewalls(opts.allVMs, res.ipfData.vms, log, cb);
         }
 
     ] }, function (err, res) {
@@ -1704,21 +1372,34 @@ function applyChanges(opts, callback) {
             vms: res.state.ipfData.vms
         };
 
-        if (opts.save && opts.save.rules) {
-            toReturn.rules = opts.save.rules.map(function (r) {
-                return r.serialize();
-            });
+        if (opts.save) {
+            if (opts.save.rules) {
+                toReturn.rules = opts.save.rules.map(function (r) {
+                    return r.serialize();
+                });
+            }
+
+            if (opts.save.remoteVMs) {
+                toReturn.remoteVMs = Object.keys(opts.save.remoteVMs).sort();
+            }
         }
 
-        if (opts.del && opts.del.rules) {
-            toReturn.rules = opts.del.rules.map(function (r) {
-                return r.serialize();
-            });
+        if (opts.del) {
+            if (opts.del.rules) {
+                toReturn.rules = opts.del.rules.map(function (r) {
+                    return r.serialize();
+                });
+            }
+
+            if (opts.del.rvms && opts.del.rvms.length !== 0) {
+                toReturn.remoteVMs = opts.del.rvms.sort();
+            }
         }
 
         if (opts.filecontents) {
             toReturn.files = res.state.ipfData.files;
         }
+
         return callback(null, toReturn);
     });
 }
@@ -1737,7 +1418,7 @@ function applyChanges(opts, callback) {
  *   - remoteVMs {Array} : list of remote VMs to add
  *   - rules {Array} : list of rules
  *   - vms {Array} : list of VMs from vmadm
- * @param {Function} callback : of the form f(err, res)
+ * @param {Function} callback : `f(err, res)`
  */
 function add(opts, callback) {
     try {
@@ -1745,6 +1426,7 @@ function add(opts, callback) {
         assert.optionalArrayOfObject(opts.rules, 'opts.rules');
         assert.optionalArrayOfObject(opts.localVMs, 'opts.localVMs');
         assert.optionalArrayOfObject(opts.remoteVMs, 'opts.remoteVMs');
+        assert.optionalString(opts.createdBy, 'opts.createdBy');
 
         var optRules = opts.rules || [];
         var optLocalVMs = opts.localVMs || [];
@@ -1757,33 +1439,36 @@ function add(opts, callback) {
     } catch (err) {
         return callback(err);
     }
-    logEntry(opts, 'add');
+    var log = util_log.entry(opts, 'add');
 
     pipeline({
     funcs: [
-        function rules(_, cb) { createRules(opts.rules, cb); },
+        function rules(_, cb) {
+            createRules(opts.rules, opts.createdBy, cb);
+        },
 
-        function vms(_, cb) { createVMlookup(opts.vms, cb); },
+        function vms(_, cb) { createVMlookup(opts.vms, log, cb); },
 
-        function disk(_, cb) { loadDataFromDisk(cb); },
+        function disk(_, cb) { loadDataFromDisk(log, cb); },
 
         function newRemoteVMs(res, cb) {
-            createRemoteVMs(res.vms, opts.remoteVMs, cb);
+            mod_rvm.create(res.vms, opts.remoteVMs, log, cb);
         },
 
         // Create remote VMs (if any) from payload
         function remoteVMs(res, cb) {
-            createRemoteVMlookup(res.newRemoteVMs, cb);
+            createRemoteVMlookup(res.newRemoteVMs, log, cb);
         },
 
         // Create a combined remote VM lookup of remote VMs on disk plus
         // new remote VMs in the payload
         function allRemoteVMs(res, cb) {
-            createRemoteVMlookup([res.disk.remoteVMs, res.newRemoteVMs], cb);
+            createRemoteVMlookup([res.disk.remoteVMs, res.newRemoteVMs],
+                log, cb);
         },
 
         function localVMs(res, cb) {
-            lookupVMs(res.vms, opts.localVMs, cb);
+            lookupVMs(res.vms, opts.localVMs, log, cb);
         },
 
         function allRules(res, cb) {
@@ -1792,24 +1477,31 @@ function add(opts, callback) {
 
         // Get VMs the added rules affect
         function matchingVMs(res, cb) {
-            filterVMsByRules(res.vms, res.rules, cb);
+            filter.vmsByRules({
+                log: log,
+                rules: res.rules,
+                vms: res.vms
+            }, cb);
         },
 
         // Get rules the added remote VMs affect
         function remoteVMrules(res, cb) {
-            filterRulesByRemoteVMs(res.remoteVMs, res.allRules, cb);
+            filter.rulesByRVMs(res.remoteVMs, res.allRules, log, cb);
         },
 
         // Get any rules that the added local VMs target
         function localVMrules(res, cb) {
-            filterRulesByVMs(res.vms, res.localVMs, res.allRules, cb);
+            filter.rulesByVMs(res.vms, res.localVMs, res.allRules, log, cb);
         },
 
         // Merge the local and remote VM rules, and use that list to find
         // the VMs affected
         function localAndRemoteVMsAffected(res, cb) {
-            filterVMsByRules(res.vms,
-                dedupRules(res.localVMrules, res.remoteVMrules), cb);
+            filter.vmsByRules({
+                log: log,
+                rules: dedupRules(res.localVMrules, res.remoteVMrules),
+                vms: res.vms
+            }, cb);
         },
 
         function mergedVMs(res, cb) {
@@ -1821,7 +1513,7 @@ function add(opts, callback) {
         // Get the rules that need to be written out for all VMs, before and
         // after the update
         function vmRules(res, cb) {
-            filterRulesByVMs(res.vms, res.mergedVMs, res.allRules, cb);
+            filter.rulesByVMs(res.vms, res.mergedVMs, res.allRules, log, cb);
         },
 
         function apply(res, cb) {
@@ -1836,19 +1528,17 @@ function add(opts, callback) {
                     remoteVMs: res.newRemoteVMs
                 },
                 vms: res.mergedVMs
-            }, cb);
+            }, log, cb);
         }
 
     ]}, function (err, res) {
         if (err) {
-            LOG.error(err, 'add: return');
+            util_log.finishErr(log, err, 'add: finish');
             return callback(err);
         }
 
-        var toReturn = res.state.apply;
-        LOG.debug({ vms: toReturn.vms, serializedRules: toReturn.rules },
-            'add: return');
-        return callback(err, toReturn);
+        log.debug(res.state.apply, 'add: finish');
+        return callback(err, res.state.apply);
     });
 }
 
@@ -1859,41 +1549,77 @@ function add(opts, callback) {
  * @param {Object} opts : options
  *   - uuids {Array} : list of rules
  *   - vms {Array} : list of VMs from vmadm
- * @param {Function} callback : of the form f(err, res)
+ * @param {Function} callback : `f(err, res)`
  */
 function del(opts, callback) {
     try {
         assert.object(opts, 'opts');
-        assert.arrayOfString(opts.uuids, 'opts.uuids');
+        assert.optionalArrayOfString(opts.rvmUUIDs, 'opts.rvmUUIDs');
+        assert.optionalArrayOfString(opts.uuids, 'opts.uuids');
         assert.arrayOfObject(opts.vms, 'vms');
+
+        var rvmUUIDs = opts.rvmUUIDs || [];
+        var uuids = opts.uuids || [];
+        if (rvmUUIDs.length === 0 && uuids.length === 0) {
+            throw new Error(
+                'Payload must contain one of: rvmUUIDs, uuids');
+        }
+
     } catch (err) {
         return callback(err);
     }
-    logEntry(opts, 'del');
+    var log = util_log.entry(opts, 'del');
 
     pipeline({
     funcs: [
-        function vms(_, cb) { createVMlookup(opts.vms, cb); },
+        function vms(_, cb) { createVMlookup(opts.vms, log, cb); },
 
-        function disk(_, cb) { loadDataFromDisk(cb); },
+        function disk(_, cb) { loadDataFromDisk(log, cb); },
 
         function allRemoteVMs(state, cb) {
-            createRemoteVMlookup(state.disk.remoteVMs, cb);
+            createRemoteVMlookup(state.disk.remoteVMs, log, cb);
         },
 
+        // Get matching remote VMs
+        function remoteVMs(state, cb) {
+            filter.rvmsByUUIDs(state.allRemoteVMs, opts.rvmUUIDs, log, cb);
+        },
+
+        // Get rules the delted remote VMs affect
+        function remoteVMrules(res, cb) {
+            filter.rulesByRVMs(res.remoteVMs.matching, res.disk.rules,
+                log, cb);
+        },
+
+        // Get VMs that are affected by the remote VM rules
+        function rvmVMs(res, cb) {
+            filter.vmsByRules({
+                log: log,
+                rules: res.remoteVMrules,
+                vms: res.vms
+            }, cb);
+        },
+
+        // Get the deleted rules
         function rules(res, cb) {
-            filterRulesByUUIDs(res.disk.rules, opts.uuids, cb);
+            filter.rulesByUUIDs(res.disk.rules, opts.uuids, log, cb);
         },
 
-        // Get VMs the rules affect
-        function matchingVMs(res, cb) {
-            filterVMsByRules(res.vms, res.rules.matching, cb);
+        // Get VMs the deleted rules affect
+        function ruleVMs(res, cb) {
+            filter.vmsByRules({
+                log: log,
+                rules: res.rules.matching,
+                vms: res.vms
+            }, cb);
         },
 
-        // Now find all rules that apply to those VMs
+        // Now find all rules that apply to those VMs, omitting the
+        // rules that are deleted
         function vmRules(res, cb) {
-            filterRulesByVMs(res.vms, res.matchingVMs,
-                res.rules.notMatching, cb);
+            filter.rulesByVMs(res.vms,
+                mergeObjects(res.ruleVMs, res.rvmVMs),
+                res.rules.notMatching, log, cb);
         },
 
         function apply(res, cb) {
@@ -1901,24 +1627,58 @@ function del(opts, callback) {
                 allVMs: res.vms,
                 dryrun: opts.dryrun,
                 filecontents: opts.filecontents,
-                allRemoteVMs: res.allRemoteVMs,
+                allRemoteVMs: res.remoteVMs.notMatching,
                 rules: res.vmRules,
                 del: {
-                    rules: res.rules.matching
+                    rules: res.rules.matching,
+                    rvms: objEmpty(res.remoteVMs.matching.all) ?
+                        null : Object.keys(res.remoteVMs.matching.all)
                 },
-                vms: res.matchingVMs
-            }, cb);
+                vms: mergeObjects(res.ruleVMs, res.rvmVMs)
+            }, log, cb);
         }
 
     ]}, function (err, res) {
         if (err) {
-            LOG.error(err, 'del: return');
+            util_log.finishErr(log, err, 'del: finish');
             return callback(err);
         }
 
-        var toReturn = res.state.apply;
-        LOG.debug(toReturn, 'del: return');
-        return callback(err, toReturn);
+        log.debug(res.state.apply, 'del: finish');
+        return callback(err, res.state.apply);
+    });
+}
+
+
+/**
+ * Returns a remote VM
+ *
+ * @param opts {Object} : options:
+ * - remoteVM {String} : UUID of remote VM to get
+ * @param callback {Function} : `function (err, rvm)`
+ */
+function getRemoteVM(opts, callback) {
+    try {
+        assert.object(opts, 'opts');
+        assert.string(opts.remoteVM, 'opts.remoteVM');
+    } catch (err) {
+        return callback(err);
+    }
+    var log = util_log.entry(opts, 'getRemoteVM', true);
+
+    return mod_rvm.load(opts.remoteVM, log, function (err, rvm) {
+        if (err) {
+            if (err.code == 'ENOENT') {
+                // Don't write a log file for "not found"
+                log.info(err, 'getRemoteVM: finish');
+            } else {
+                util_log.finishErr(log, err, 'getRemoteVM: finish');
+            }
+            return callback(err);
+        }
+
+        log.debug(rvm, 'getRemoteVM: finish');
+        return callback(null, rvm);
     });
 }
 
@@ -1937,22 +1697,52 @@ function getRule(opts, callback) {
     } catch (err) {
         return callback(err);
     }
-    opts.readOnly = true;
-    logEntry(opts, 'get');
+    var log = util_log.entry(opts, 'get', true);
 
-    var file = util.format('%s/%s.json', RULE_PATH, opts.uuid);
-    return loadRule(file, function (err, rule) {
+    return loadRule(opts.uuid, log, function (err, rule) {
         if (err) {
             if (err.code == 'ENOENT') {
-                return callback(new verror.VError('Unknown rule "%s"',
-                    opts.uuid));
+                // Don't write a log file for "not found"
+                log.info(err, 'get: finish');
+            } else {
+                util_log.finishErr(log, err, 'get: finish');
             }
-
-            LOG.error(err, 'getRule: return');
             return callback(err);
         }
 
-        return callback(null, rule.serialize());
+        var ser = rule.serialize();
+        log.debug(ser, 'get: finish');
+        return callback(null, ser);
+    });
+}
+
+
+/**
+ * List remote VMs
+ */
+function listRemoteVMs(opts, callback) {
+    try {
+        assert.object(opts, 'opts');
+    } catch (err) {
+        return callback(err);
+    }
+    var log = util_log.entry(opts, 'listRemoteVMs', true);
+
+    mod_rvm.loadAll(log, function (err, res) {
+        if (err) {
+            util_log.finishErr(log, err, 'listRemoteVMs: finish');
+            return callback(err);
+        }
+
+        // XXX: support sorting by other fields, filtering
+        var sortFn = function _sort(a, b) {
+            return (a.uuid > b.uuid) ? 1: -1;
+        };
+
+        log.debug('listRemoteVMs: finish');
+        return callback(null, Object.keys(res).map(function (r) {
+            return res[r];
+        }).sort(sortFn));
     });
 }
 
@@ -1963,26 +1753,64 @@ function getRule(opts, callback) {
 function listRules(opts, callback) {
     try {
         assert.object(opts, 'opts');
+        assert.optionalArrayOfString(opts.fields, 'opts.fields');
+        if (opts.fields) {
+            var invalid = [];
+            opts.fields.forEach(function (f) {
+                if (mod_rule.FIELDS.indexOf(f) === -1) {
+                    invalid.push(f);
+                }
+            });
+
+            if (invalid.length > 0) {
+                throw new verror.VError('Invalid display field%s: %s',
+                    invalid.length == 1 ? '' : 's',
+                    invalid.sort().join(', '));
+            }
+        }
     } catch (err) {
         return callback(err);
     }
-    opts.readOnly = true;
-    logEntry(opts, 'list');
+    var log = util_log.entry(opts, 'list', true);
 
-    loadAllRules(function (err, res) {
+    loadAllRules(log, function (err, res) {
         if (err) {
-            LOG.error(err, 'listRules: return');
+            util_log.finishErr(log, err, 'list: finish');
             return callback(err);
         }
 
         // XXX: support sorting by other fields, filtering
         // (eg: enabled=true vm=<uuid>)
-        var sortFn = function _sort(a, b) {
+        var sortFn = function _defaultSort(a, b) {
             return (a.uuid > b.uuid) ? 1: -1;
         };
+        var mapFn = function _defaultMap(r) {
+            return r.serialize();
+        };
 
-        return callback(null,
-            res.map(function (r) { return r.serialize(); }).sort(sortFn));
+        if (opts.fields) {
+            var filterFields = opts.fields;
+            // If we didn't include uuid in the fields to list, include
+            // it here so that we can sort by it - we'll remove it after
+            if (opts.fields.indexOf('uuid') === -1) {
+                filterFields = opts.fields.concat(['uuid']);
+            }
+
+            mapFn = function _fieldMap(r) {
+                return r.serialize(filterFields);
+            };
+        }
+
+        var rules = res.map(mapFn).sort(sortFn);
+        if (opts.fields && opts.fields.indexOf('uuid') === -1) {
+            rules = rules.map(function (r) {
+                delete r.uuid;
+                return r;
+            });
+        }
+
+        log.debug('list: finish');
+        return callback(null, rules);
     });
 }
 
@@ -2008,15 +1836,15 @@ function enableVM(opts, callback) {
     } catch (err) {
         return callback(err);
     }
-    logEntry(opts, 'enable');
+    var log = util_log.entry(opts, 'enable');
 
     var vmFilter = {};
 
     pipeline({
     funcs: [
-        function vms(_, cb) { createVMlookup(opts.vms, cb); },
+        function vms(_, cb) { createVMlookup(opts.vms, log, cb); },
 
-        function disk(_, cb) { loadDataFromDisk(cb); },
+        function disk(_, cb) { loadDataFromDisk(log, cb); },
 
         function getVM(res, cb) {
             var vm = res.vms.all[opts.vm.uuid];
@@ -2030,11 +1858,11 @@ function enableVM(opts, callback) {
 
         // Find all rules that apply to the VM
         function vmRules(res, cb) {
-            filterRulesByVMs(res.vms, vmFilter, res.disk.rules, cb);
+            filter.rulesByVMs(res.vms, vmFilter, res.disk.rules, log, cb);
         },
 
         function allRemoteVMs(res, cb) {
-            createRemoteVMlookup(res.disk.remoteVMs, cb);
+            createRemoteVMlookup(res.disk.remoteVMs, log, cb);
         },
 
         function apply(res, cb) {
@@ -2045,16 +1873,16 @@ function enableVM(opts, callback) {
                 allRemoteVMs: res.allRemoteVMs,
                 rules: res.vmRules,
                 vms: vmFilter
-            }, cb);
+            }, log, cb);
         }
     ]}, function _afterEnable(err, res) {
         if (err) {
-            LOG.error(err, 'enableVM: return');
+            util_log.finishErr(log, err, 'enable: finish');
             return callback(err);
         }
 
         var toReturn = res.state.apply;
-        LOG.debug(toReturn, 'enableVM: return');
+        log.debug(toReturn, 'enable: finish');
         return callback(null, toReturn);
     });
 }
@@ -2074,7 +1902,7 @@ function disableVM(opts, callback) {
     } catch (err) {
         return callback(err);
     }
-    logEntry(opts, 'disable');
+    var log = util_log.entry(opts, 'disable');
 
     pipeline({
     funcs: [
@@ -2093,15 +1921,23 @@ function disableVM(opts, callback) {
         },
         function stop(_, cb) {
             if (opts.vm.state !== 'running') {
-                LOG.debug('disableVM: VM "%s" not stopping ipf (state=%s)',
+                log.debug('disableVM: VM "%s": not stopping ipf (state=%s)',
                     opts.vm.uuid, opts.vm.state);
                 return cb(null);
             }
 
-            LOG.debug('disableVM: stopping ipf for VM "%s"', opts.vm.uuid);
-            return mod_ipf.stop(opts.vm.uuid, LOG, cb);
+            log.debug('disableVM: stopping ipf for VM "%s"', opts.vm.uuid);
+            return mod_ipf.stop(opts.vm.uuid, log, cb);
         }
-    ]}, callback);
+    ]}, function _afterDisable(err) {
+        if (err) {
+            util_log.finishErr(log, err, 'disable: finish');
+            return callback(err);
+        }
+
+        log.debug('disable: finish');
+        return callback();
+    });
 }
 
 
@@ -2119,19 +1955,22 @@ function vmStatus(opts, callback) {
     } catch (err) {
         return callback(err);
     }
-    opts.readOnly = true;
-    logEntry(opts, 'status');
+    var log = util_log.entry(opts, 'status', true);
 
-    return mod_ipf.status(opts.uuid, LOG, function (err, res) {
+    return mod_ipf.status(opts.uuid, log, function (err, res) {
         if (err) {
             // 'No such device' is returned when the zone is down
             if (res && res.stderr
                 && res.stderr.indexOf('Could not find running zone') !== -1) {
+                log.debug({ running: false }, 'status: finish');
                 return callback(null, { running: false });
             }
+
+            util_log.finishErr(log, err, 'status: finish');
             return callback(err);
         }
 
+        log.debug(res, 'status: finish');
         return callback(null, res);
     });
 }
@@ -2151,28 +1990,32 @@ function vmStats(opts, callback) {
     } catch (err) {
         return callback(err);
     }
-    opts.readOnly = true;
-    logEntry(opts, 'stats');
+    var log = util_log.entry(opts, 'stats', true);
 
-    return mod_ipf.ruleStats(opts.uuid, LOG, function (err, res) {
+    return mod_ipf.ruleStats(opts.uuid, log, function (err, res) {
         if (err) {
             if (res && res.stderr) {
                 // Zone is down
                 if (res.stderr.indexOf('Could not find running zone') !== -1) {
+                    log.debug('stats: finish: zone not running');
                     return callback(new verror.VError(
                         'Firewall is not running for VM "%s"', opts.uuid));
                 }
 
-                // No rules loaded
+                // No rules loaded: return an error if the firewall
+                // isn't running
                 if (res.stderr.indexOf('empty list') !== -1) {
                     return vmStatus(opts, function (err2, res2) {
                         if (err2) {
+                            util_log.finishErr(log, err2, 'stats: finish');
                             return callback(err2);
                         }
 
                         if (res2.running) {
+                            log.debug({ rules: [] }, 'stats: finish');
                             return callback(null, { rules: [] });
                         } else {
+                            log.debug('stats: finish: firewall not running');
                             return callback(new verror.VError(
                                 'Firewall is not running for VM "%s"',
                                 opts.uuid));
@@ -2184,6 +2027,7 @@ function vmStats(opts, callback) {
             return callback(err);
         }
 
+        log.debug({ rules: res }, 'stats: finish');
         return callback(null, { rules: res });
     });
 }
@@ -2197,7 +2041,7 @@ function vmStats(opts, callback) {
  *   - remoteVMs {Array} : list of remote VMs to update
  *   - rules {Array} : list of rules
  *   - vms {Array} : list of VMs from vmadm
- * @param {Function} callback : of the form f(err, res)
+ * @param {Function} callback : `f(err, res)`
  */
 function update(opts, callback) {
     try {
@@ -2205,6 +2049,7 @@ function update(opts, callback) {
         assert.optionalArrayOfObject(opts.rules, 'opts.rules');
         assert.optionalArrayOfObject(opts.localVMs, 'opts.localVMs');
         assert.optionalArrayOfObject(opts.remoteVMs, 'opts.remoteVMs');
+        assert.optionalString(opts.createdBy, 'opts.createdBy');
 
         var optRules = opts.rules || [];
         var optLocalVMs = opts.localVMs || [];
@@ -2217,11 +2062,11 @@ function update(opts, callback) {
     } catch (err) {
         return callback(err);
     }
-    logEntry(opts, 'update');
+    var log = util_log.entry(opts, 'update');
 
     pipeline({
     funcs: [
-        function disk(_, cb) { loadDataFromDisk(cb); },
+        function disk(_, cb) { loadDataFromDisk(log, cb); },
 
         // Make sure the rules exist
         function originalRules(res, cb) {
@@ -2229,47 +2074,57 @@ function update(opts, callback) {
                 allRules: res.disk.rules,
                 allowAdds: opts.allowAdds,
                 rules: opts.rules
-            }, cb);
+            }, log, cb);
         },
 
         // Apply updates to the found rules
         function rules(res, cb) {
             createUpdatedRules({
+                createdBy: opts.createdBy,
                 originalRules: res.originalRules,
                 updatedRules: opts.rules
-            }, cb);
+            }, log, cb);
         },
 
         // Create the VM lookup
-        function vms(_, cb) { createVMlookup(opts.vms, cb); },
+        function vms(_, cb) { createVMlookup(opts.vms, log, cb); },
 
         // Create remote VMs (if any) from payload
         function newRemoteVMs(res, cb) {
-            createRemoteVMs(res.vms, opts.remoteVMs, cb);
+            mod_rvm.create(res.vms, opts.remoteVMs, log, cb);
         },
 
         // Create a lookup for the new remote VMs
         function newRemoteVMsLookup(res, cb) {
-            createRemoteVMlookup(res.newRemoteVMs, cb);
+            createRemoteVMlookup(res.newRemoteVMs, log, cb);
         },
 
         function allRemoteVMs(res, cb) {
-            createRemoteVMlookup([res.disk.remoteVMs, res.newRemoteVMs], cb);
+            createRemoteVMlookup([res.disk.remoteVMs, res.newRemoteVMs],
+                log, cb);
         },
 
         // Lookup any local VMs in the payload
         function localVMs(res, cb) {
-            lookupVMs(res.vms, opts.localVMs, cb);
+            lookupVMs(res.vms, opts.localVMs, log, cb);
         },
 
         // Get the VMs the rules applied to before the update
         function originalVMs(res, cb) {
-            filterVMsByRules(res.vms, res.originalRules, cb);
+            filter.vmsByRules({
+                log: log,
+                rules: res.originalRules,
+                vms: res.vms
+            }, cb);
         },
 
         // Now get the VMs the updated rules apply to
         function matchingVMs(res, cb) {
-            filterVMsByRules(res.vms, res.rules, cb);
+            filter.vmsByRules({
+                log: log,
+                rules: res.rules,
+                vms: res.vms
+            }, cb);
         },
 
         // Replace the rules with their updated versions
@@ -2279,20 +2134,23 @@ function update(opts, callback) {
 
         // Get any rules that the added remote VMs target
         function remoteVMrules(res, cb) {
-            filterRulesByRemoteVMs(res.newRemoteVMsLookup,
-                res.updatedRules, cb);
+            filter.rulesByRVMs(res.newRemoteVMsLookup,
+                res.updatedRules, log, cb);
         },
 
         // Get any rules that the added local VMs target
         function localVMrules(res, cb) {
-            filterRulesByVMs(res.vms, res.localVMs, res.updatedRules, cb);
+            filter.rulesByVMs(res.vms, res.localVMs, res.updatedRules, log, cb);
         },
 
         // Merge the local and remote VM rules, and use that list to find
         // the VMs affected
         function localAndRemoteVMsAffected(res, cb) {
-            filterVMsByRules(res.vms,
-                dedupRules(res.localVMrules, res.remoteVMrules), cb);
+            filter.vmsByRules({
+                log: log,
+                rules: dedupRules(res.localVMrules, res.remoteVMrules),
+                vms: res.vms
+            }, cb);
         },
 
         function mergedVMs(res, cb) {
@@ -2304,7 +2162,8 @@ function update(opts, callback) {
         // Get the rules that need to be written out for all VMs, before and
         // after the update
         function vmRules(res, cb) {
-            filterRulesByVMs(res.vms, res.mergedVMs, res.updatedRules, cb);
+            filter.rulesByVMs(res.vms, res.mergedVMs, res.updatedRules, log,
+                cb);
         },
 
         function apply(res, cb) {
@@ -2319,18 +2178,201 @@ function update(opts, callback) {
                     remoteVMs: res.newRemoteVMs
                 },
                 vms: res.mergedVMs
+            }, log, cb);
+        }
+    ]}, function (err, res) {
+        if (err) {
+            util_log.finishErr(log, err, 'update: finish');
+            return callback(err);
+        }
+
+        log.debug(res.state.apply, 'update: finish');
+        return callback(err, res.state.apply);
+    });
+}
+
+
+/**
+ * Given the list of local VMs and a list of rules, return an object with
+ * the non-local targets on the other side of the rules.
+ *
+ * @param opts {Object} : options:
+ * - vms {Array} : array of VM objects (as per VM.js)
+ * - rules {Array of Objects} : firewall rules
+ * @param callback {Function} `function (err, targets)`
+ * - Where targets is an object like:
+ *   {
+ *     tags: { some: ['one', 'two'], other: true },
+ *     vms: [ '<UUID>' ],
+ *     allVMs: true
+ *   }
+ */
+function getRemoteTargets(opts, callback) {
+    try {
+        assert.object(opts, 'opts');
+        assert.arrayOfObject(opts.vms, 'opts.vms');
+        assert.arrayOfObject(opts.rules, 'opts.rules');
+
+        if (opts.rules.length === 0) {
+            throw new Error('Must specify rules');
+        }
+
+    } catch (err) {
+        return callback(err);
+    }
+    var log = util_log.entry(opts, 'remoteTargets', true);
+
+    createRules(opts.rules, function (err, rules) {
+        if (err) {
+            util_log.finishErr(log, err, 'remoteTargets: finish: createRules');
+            return callback(err);
+        }
+
+        createVMlookup(opts.vms, log, function (err2, vms) {
+            if (err2) {
+                util_log.finishErr(log, err2,
+                    'remoteTargets: finish: createVMlookup');
+                return callback(err2);
+            }
+
+            var targets = {};
+
+            for (var r in rules) {
+                var rule = rules[r];
+
+                for (var d in DIRECTIONS) {
+                    var dir = DIRECTIONS[d];
+                    addOtherSideRemoteTargets(vms, rule, targets, dir, log);
+                }
+            }
+
+            if (targets.hasOwnProperty('vms')) {
+                targets.vms = Object.keys(targets.vms);
+                if (targets.vms.length === 0) {
+                    delete targets.vms;
+                }
+            }
+
+            log.debug(targets, 'remoteTargets: finish');
+            return callback(null, targets);
+        });
+    });
+}
+
+
+/**
+ * Gets VMs that are affected by a rule
+ *
+ * @param opts {Object} : options:
+ * - vms {Array} : array of VM objects (as per VM.js)
+ * - rule {UUID or Object} : UUID of pre-existing rule, or a rule object
+ * - includeDisabled {Boolean, optional} : if set, include VMs that have
+ *   their firewalls disabled in the search
+ * @param callback {Function} `function (err, vms)`
+ * - Where vms is an array of VMs that are affected by that rule
+ */
+function getRuleVMs(opts, callback) {
+    try {
+        assert.object(opts, 'opts');
+        assert.arrayOfObject(opts.vms, 'opts.vms');
+        assertStringOrObject(opts.rule, 'opts.rule');
+        assert.optionalBool(opts.includeDisabled, 'opts.includeDisabled');
+    } catch (err) {
+        return callback(err);
+    }
+    var log = util_log.entry(opts, 'vms', true);
+
+    pipeline({
+    funcs: [
+        function rules(_, cb) {
+            if (typeof (opts.rule) === 'string') {
+                return loadRule(opts.rule, log, cb);
+            }
+
+            createRules([ opts.rule ], cb);
+        },
+        function vms(_, cb) { createVMlookup(opts.vms, log, cb); },
+        function ruleVMs(state, cb) {
+            if (!util.isArray(state.rules)) {
+                state.rules = [ state.rules ];
+            }
+
+            filter.vmsByRules({
+                includeDisabled: opts.includeDisabled,
+                log: log,
+                rules: state.rules,
+                vms: state.vms
             }, cb);
         }
     ]}, function (err, res) {
         if (err) {
-            LOG.error(err, 'update: return');
+            util_log.finishErr(log, err, 'vms: finish');
             return callback(err);
         }
 
-        var toReturn = res.state.apply;
-        LOG.debug({ vms: toReturn.vms, serializedRules: toReturn.rules },
-            'update: return');
-        return callback(err, toReturn);
+        var matched = Object.keys(res.state.ruleVMs);
+        log.debug(matched, 'vms: finish');
+        return callback(null, matched);
+    });
+}
+
+
+/**
+ * Gets rules that apply to a Remote VM
+ *
+ * @param opts {Object} : options:
+ * - vms {Array} : array of VM objects (as per VM.js)
+ * - vm {UUID} : UUID of VM to get the rules for
+ * @param callback {Function} `function (err, rules)`
+ * - Where rules is an array of rules that apply to the VM
+ */
+function getRemoteVMrules(opts, callback) {
+    try {
+        assert.object(opts, 'opts');
+        assertStringOrObject(opts.remoteVM, 'opts.remoteVM');
+        assert.arrayOfObject(opts.vms, 'opts.vms');
+    } catch (err) {
+        return callback(err);
+    }
+    var log = util_log.entry(opts, 'rvmRules', true);
+
+    pipeline({
+    funcs: [
+        function allRules(_, cb) { loadAllRules(log, cb); },
+        function vms(_, cb) { createVMlookup(opts.vms, log, cb); },
+        function rvm(_, cb) {
+            if (typeof (opts.remoteVM) === 'object') {
+                return cb(null, opts.remoteVM);
+            }
+
+            return mod_rvm.load(opts.remoteVM, log, cb);
+        },
+        function rvms(state, cb) {
+            return mod_rvm.create(state.vms, [ state.rvm ],
+                log, function (e, rvmList) {
+                if (e) {
+                    return cb(e);
+                }
+
+                createRemoteVMlookup(rvmList, log, cb);
+            });
+        },
+        function rvmRules(state, cb) {
+            filter.rulesByRVMs(state.rvms, state.allRules, log, cb);
+        }
+    ]}, function (err, res) {
+        if (err) {
+            util_log.finishErr(log, err, 'rvmRules: finish (vm=%s)',
+                opts.remoteVM);
+            return callback(err);
+        }
+
+        var toReturn = res.state.rvmRules.map(function (r) {
+            return r.serialize();
+        });
+
+        log.debug(toReturn, 'rvmRules: finish (vm=%s)', opts.remoteVM);
+        return callback(null, toReturn);
     });
 }
 
@@ -2352,21 +2394,21 @@ function getVMrules(opts, callback) {
     } catch (err) {
         return callback(err);
     }
-    opts.readOnly = true;
-    logEntry(opts, 'rules');
+    var log = util_log.entry(opts, 'vmRules', true);
 
     var toFind = {};
     toFind[opts.vm] = opts.vm;
 
     pipeline({
     funcs: [
-        function allRules(_, cb) { loadAllRules(cb); },
-        function vms(_, cb) { createVMlookup(opts.vms, cb); },
+        function allRules(_, cb) { loadAllRules(log, cb); },
+        function vms(_, cb) { createVMlookup(opts.vms, log, cb); },
         function vmRules(state, cb) {
-            filterRulesByVMs(state.vms, toFind, state.allRules, cb);
+            filter.rulesByVMs(state.vms, toFind, state.allRules, log, cb);
         }
     ]}, function (err, res) {
         if (err) {
+            util_log.finishErr(log, err, 'vmRules: finish (vm=%s)', opts.vm);
             return callback(err);
         }
 
@@ -2374,7 +2416,7 @@ function getVMrules(opts, callback) {
             return r.serialize();
         });
 
-        LOG.debug(toReturn, 'getVMrules: return (vm=%s)', opts.vm);
+        log.debug(toReturn, 'vmRules: finish (vm=%s)', opts.vm);
         return callback(null, toReturn);
     });
 }
@@ -2410,34 +2452,35 @@ function validatePayload(opts, callback) {
     } catch (err) {
         return callback(err);
     }
-    logEntry(opts, 'validatePayload');
+    var log = util_log.entry(opts, 'validatePayload');
 
     pipeline({
     funcs: [
         function rules(_, cb) {
             createRules(opts.rules, cb);
         },
-        function vms(_, cb) { createVMlookup(opts.vms, cb); },
-        function remoteVMs(_, cb) { loadAllRemoteVMs(cb); },
+        function vms(_, cb) { createVMlookup(opts.vms, log, cb); },
+        function remoteVMs(_, cb) { mod_rvm.loadAll(log, cb); },
         function newRemoteVMs(state, cb) {
-            createRemoteVMs(state.vms, opts.remoteVMs, cb);
+            mod_rvm.create(state.vms, opts.remoteVMs, log, cb);
         },
         // Create a combined remote VM lookup of remote VMs on disk plus
         // new remote VMs in the payload
         function allRemoteVMs(state, cb) {
-            createRemoteVMlookup([state.remoteVMs, state.newRemoteVMs], cb);
+            createRemoteVMlookup([state.remoteVMs, state.newRemoteVMs],
+                log, cb);
         },
 
         function validate(state, cb) {
-            validateRules(state.vms, state.allRemoteVMs, state.rules, cb);
+            validateRules(state.vms, state.allRemoteVMs, state.rules, log, cb);
         }
     ]}, function (err, res) {
         if (err) {
-            LOG.error(err, 'validatePayload: return');
+            util_log.finishErr(log, err, 'validatePayload: finish');
             return callback(err);
         }
 
-        LOG.debug(opts.payload, 'validatePayload: return OK');
+        log.debug(opts.payload, 'validatePayload: finish');
         return callback();
     });
 }
@@ -2445,16 +2488,23 @@ function validatePayload(opts, callback) {
 
 
 module.exports = {
+    _setOldIPF: mod_ipf._setOld,
     add: add,
     del: del,
     disable: disableVM,
     enable: enableVM,
     get: getRule,
+    getRVM: getRemoteVM,
     list: listRules,
-    rules: getVMrules,
+    listRVMs: listRemoteVMs,
+    remoteTargets: getRemoteTargets,
+    rvmRules: getRemoteVMrules,
+    setBunyan: util_log.setBunyan,
     stats: vmStats,
     status: vmStatus,
     update: update,
     validatePayload: validatePayload,
-    VM_FIELDS: VM_FIELDS
+    VM_FIELDS: VM_FIELDS,
+    vmRules: getVMrules,
+    vms: getRuleVMs
 };

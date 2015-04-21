@@ -4,9 +4,11 @@
  * mocks for tests
  */
 
+var clone = require('clone');
 var fw;
 var mockery = require('mockery');
 var mod_obj = require('../../lib/util/obj');
+var util = require('util');
 
 var createSubObjects = mod_obj.createSubObjects;
 
@@ -19,6 +21,30 @@ var createSubObjects = mod_obj.createSubObjects;
 var IPF = '/usr/sbin/ipf';
 var VALUES = {};
 var LOG = false;
+var MOCKS = {
+    bunyan: {
+        createLogger: createLogger,
+        RingBuffer: mockRingBuffer,
+        stdSerializers: {
+            err: errSerializer
+        },
+        resolveLevel: resolveLevel
+    },
+    child_process: {
+        execFile: execFile
+    },
+    fs: {
+        readdir: readDir,
+        readFile: readFile,
+        readFileSync: readFileSync,
+        rename: rename,
+        unlink: unlink,
+        writeFile: writeFile
+    },
+    mkdirp: mkdirp
+};
+var ORIG_PROCESS;
+var PID;
 
 
 
@@ -46,26 +72,48 @@ function _splitFile(f) {
 
 
 
-function _log(level, args) {
-    if (args.length !== 0) {
-        VALUES.bunyan[level].push(args);
-        if (LOG) {
-            console.error('# %s %j', level, args);
+function _log(level, num, obj) {
+    if (obj && obj[0]) {
+        VALUES.bunyan[level].push(Array.prototype.slice.call(obj, 1));
+        if (LOG || process.env.LOG) {
+            var json = {};
+            var msgArgs;
+
+            if (typeof (obj[0]) !== 'string') {
+                json = clone(obj[0]);
+                msgArgs = Array.prototype.slice.call(obj, 1);
+            } else {
+                msgArgs = Array.prototype.slice.call(obj);
+            }
+
+            json.hostname = 'fw-test';
+            json.name = 'fw-test';
+            json.pid = process.pid;
+            json.v = 0;
+            json.msg = util.format.apply(null, msgArgs);
+            json.level = num;
+            json.time = (new Date());
+
+            console.error(JSON.stringify(json));
         }
     }
+
     return true;
 }
 
 
 function createLogger() {
     return {
-        trace: function () { return _log('trace', arguments); },
-        debug: function () { return _log('debug', arguments); },
-        error: function () { return _log('error', arguments); },
-        warn: function () { return _log('warn', arguments); },
-        info: function () { return _log('info', arguments); }
+        child: function () { return this; },
+        trace: function () { return _log('trace', 10, arguments); },
+        debug: function () { return _log('debug', 20, arguments); },
+        info: function () { return _log('info', 30, arguments); },
+        warn: function () { return _log('warn', 40, arguments); },
+        error: function () { return _log('error', 50, arguments); },
+        fatal: function () { return _log('fatal', 60, arguments); }
     };
 }
+
 
 function errSerializer(err) {
     return err;
@@ -74,6 +122,11 @@ function errSerializer(err) {
 
 function mockRingBuffer(opts) {
     this.opts = opts;
+}
+
+
+function resolveLevel() {
+    return 3;
 }
 
 
@@ -89,26 +142,26 @@ function mockRingBuffer(opts) {
 function _recordIPFstate(args) {
     var zone = createSubObjects(VALUES.ipf, args[args.length - 1]);
 
-    if (args[0] == '-D') {
+    if (args[0] == '-GD') {
         zone.enabled = false;
         zone.inactive = '';
         zone.active = '';
         return;
     }
 
-    if (args[0] == '-E') {
+    if (args[0] == '-GE') {
         zone.enabled = true;
         zone.inactive = '';
         zone.active = '';
         return;
     }
 
-    if (args[0] == '-IFa') {
+    if (args[0] == '-GIFa') {
         zone.inactive = '';
         return;
     }
 
-    if (args[0] == '-s') {
+    if (args[1] == '-s') {
         var active = zone.active || '';
         var inactive = zone.inactive || '';
         zone.active = inactive;
@@ -116,9 +169,9 @@ function _recordIPFstate(args) {
         return;
     }
 
-    if (args[0] == '-I' && args[1] == '-f') {
+    if (args[1] == '-I' && args[2] == '-f') {
         var root = VALUES.fs;
-        var p = _splitFile(args[2]);
+        var p = _splitFile(args[3]);
         if (!root.hasOwnProperty(p.dir)
                 || !root[p.dir].hasOwnProperty(p.file)) {
             throw _ENOENT(p.file);
@@ -130,17 +183,25 @@ function _recordIPFstate(args) {
 }
 
 
-function execFile(path, args, cb) {
+function execFile(path, args, opts, cb) {
     var vals = VALUES.child_process[path];
     if (!vals) {
         vals = {
-            err: new Error('Uh-oh'),
+            err: new Error('child_process.execFile mock: no mock data for '
+                + path),
             stderr: null,
             stdout: null
         };
     }
 
-    // console.log('> execFile: %s %s', path, args.join(' '));
+    if (cb === undefined) {
+        cb = opts;
+    }
+
+    if (typeof (vals) == 'function') {
+        return vals.apply(null, arguments);
+    }
+
     if (path == IPF) {
         try {
             _recordIPFstate(args);
@@ -178,6 +239,19 @@ function readFile(file, cb) {
     }
 
     return cb(null, root[p.dir][p.file]);
+}
+
+
+function readFileSync(file, cb) {
+    var p = _splitFile(file);
+    var root = VALUES.fs;
+
+    if (!root.hasOwnProperty(p.dir)
+            || !root[p.dir].hasOwnProperty(p.file)) {
+        throw _ENOENT(file);
+    }
+
+    return root[p.dir][p.file];
 }
 
 
@@ -248,6 +322,16 @@ mkdirp.sync = function mkdirpSync(dir) {
 
 
 
+// --- path
+
+
+
+function basename(file) {
+    return file;
+}
+
+
+
 // --- Setup / Teardown
 
 
@@ -255,7 +339,7 @@ mkdirp.sync = function mkdirpSync(dir) {
 /**
  * Initialize VALUES to a clean state for each mock
  */
-function resetValues() {
+function resetValues(opts) {
     VALUES = {};
 
     VALUES.bunyan = {
@@ -283,71 +367,100 @@ function resetValues() {
     VALUES.fs = {};
 
     VALUES.ipf = {};
+
+    if (opts && opts.initialValues) {
+        // As a convenience, allow fs values to be full paths
+        if (opts.initialValues.hasOwnProperty('fs')) {
+            for (var f in opts.initialValues.fs) {
+                var p = _splitFile(f);
+                mkdirp.sync(p.dir);
+                VALUES.fs[p.dir][p.file] = opts.initialValues.fs[f];
+            }
+
+            for (var i in opts.initialValues) {
+                if (i == 'fs') {
+                    continue;
+                }
+
+                VALUES[i] = opts.initialValues[i];
+            }
+        }
+    }
 }
 
 
 /**
- * Enable all of the mocks, and initialize VALUES. Returns a newly-require()'d
- * fw.js with most external modules mocked out.
+ * Mock setup:
+ *   * Initialize VALUES, populating with values in opts.initialValues if
+ *     present
+ *   * Create mocks, overriding / adding to the list with mocks in opts.mocks
+ *     if present
+ *   * If opts.allowed is present, add all mocks in the list to mockery's
+ *     allowed modules
+ *   * Enable all of the mocks
+ *
+ * Returns a newly-require()'d fw.js with most external modules mocked out.
  */
-function setup() {
+function setup(opts) {
     if (fw) {
         return fw;
     }
 
-    resetValues();
-    mockery.enable();
-    var modules = {
-        '/usr/node/node_modules/bunyan': {
-            createLogger: createLogger,
-            RingBuffer: mockRingBuffer,
-            stdSerializers: {
-                err: errSerializer
-            }
-        },
-        child_process: {
-            execFile: execFile
-        },
-        fs: {
-            readdir: readDir,
-            readFile: readFile,
-            rename: rename,
-            unlink: unlink,
-            writeFile: writeFile
-        },
-        mkdirp: mkdirp,
-        path: {
-        }
-    };
+    var m;
 
-    for (var m in modules) {
-        mockery.registerMock(m, modules[m]);
+    if (!opts) {
+        opts = {};
+    }
+    if (!opts.mocks) {
+        opts.mocks = {};
     }
 
-    [
+    resetValues(opts);
+
+    mockery.enable();
+    for (m in opts.mocks) {
+        MOCKS[m] = opts.mocks[m];
+    }
+
+    for (m in MOCKS) {
+        mockery.registerMock(m, MOCKS[m]);
+    }
+
+    var allowed = [
         'assert',
         'assert-plus',
         'clone',
+        'events',
         'extsprintf',
         'fwrule',
-        'node-uuid',
         'net',
+        'node-uuid',
+        'path',
         'stream',
         'vasync',
         'verror',
         'util',
         './clonePrototype.js',
+        './filter',
         './ipf',
         './obj',
         './parser',
         './pipeline',
         './rule',
+        './rvm',
+        './util/errors',
         './util/log',
         './util/obj',
         './util/vm',
         './validators',
         '../../lib/fw'
-    ].forEach(function (mod) {
+    ];
+
+    if (opts.allowed) {
+        allowed = allowed.concat(opts.allowed);
+    }
+
+    allowed.forEach(function (mod) {
         mockery.registerAllowable(mod);
     });
 
@@ -372,6 +485,9 @@ function teardown() {
 module.exports = {
     get fw() {
         return fw;
+    },
+    get mocks() {
+        return MOCKS;
     },
     get values() {
         return VALUES;

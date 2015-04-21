@@ -25,6 +25,7 @@
 #
 
 export PS4='[\D{%FT%TZ}] ${BASH_SOURCE}:${LINENO}: ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
+export PATH=/usr/bin:/usr/sbin:$PATH
 
 set -o xtrace
 
@@ -95,22 +96,56 @@ case $? in
     ;;
 esac
 
+echo "Retrieving metadata operator-script..."
+/usr/sbin/mdata-get sdc:operator-script >/var/svc/mdata-operator-script.new
+case $? in
+  0)
+    echo "Metadata operator-script successfuly retrieved."
+    mv /var/svc/mdata-operator-script{.new,}
+    chmod +x /var/svc/mdata-operator-script
+    ;;
+  1)
+    echo "Metadata operator-script not defined."
+    rm -f /var/svc/mdata-operator-script{,.new}
+    ;;
+  *)
+    echo "Metadata couldn't be retrieved."
+    exit ${SMF_EXIT_ERR_FATAL}
+    ;;
+esac
+
 echo "Retrieving tmpfs value..."
 tmpfs=$(/usr/sbin/mdata-get sdc:tmpfs)
 if [[ $? == 0 && -n ${tmpfs} && -f /etc/vfstab ]]; then
   check="swap        -   /tmp                tmpfs";
-  new="swap        -   /tmp                tmpfs    -   yes    size=${tmpfs}m";
-  if ! /usr/bin/grep "^${new}" /etc/vfstab; then
-    if ! /usr/bin/grep "^${check}" /etc/vfstab; then
-      # no tmpfs line. add it.
-      echo "${new}" >> /etc/vfstab
-    else
-      # existing tmpfs line, but wrong value. fix it.
-      /usr/bin/sed -i "" -e "s|^swap.*/tmp.*tmpfs.*$|${new}|" /etc/vfstab
-      echo $?
+
+  if [[ ${tmpfs} == "0" ]]; then
+    # When tmpfs is set 0, we remove any entry from /etc/vfstab but cannot
+    # adjust the "live" value as current /tmp will be in-use. On reboot the
+    # new value will take effect.
+
+    grep -v "^${check}" /etc/vfstab > /etc/vfstab.new \
+      && mv /etc/vfstab.new /etc/vfstab
+  else
+    new="swap        -   /tmp                tmpfs    -   yes    size=${tmpfs}m";
+    if ! /usr/bin/grep "^${new}" /etc/vfstab; then
+      if ! /usr/bin/grep "^${check}" /etc/vfstab; then
+        # no tmpfs line. add it.
+        echo "${new}" >> /etc/vfstab
+      else
+        # existing tmpfs line, but wrong value. fix it.
+        /usr/bin/sed -i "" -e "s|^swap.*/tmp.*tmpfs.*$|${new}|" /etc/vfstab
+        echo $?
+      fi
+
+      if mount | grep "^/tmp"; then
+        # Also fix current size, since /etc/vfstab didn't have our correct line
+        # but only if we have /tmp mounted at all. If not, we'll have to wait
+        # until the next reboot since /tmp will be in-use.
+        /usr/sbin/mount -F tmpfs -o remount,size=${tmpfs}m /tmp
+      fi
+
     fi
-    # also fix current size, since /etc/vfstab didn't have our correct line
-    /usr/sbin/mount -F tmpfs -o remount,size=${tmpfs}m /tmp
   fi
 fi
 
@@ -160,8 +195,23 @@ done < <(/usr/sbin/mdata-get sdc:nics \
 
 # rebuild resolv.conf
 resolvers=$(mdata-get sdc:resolvers)
-result=$?
-if [[ ${result} == 0 ]]; then
+resolvers_result=$?
+
+# Determine if resolv.conf is managed for us
+maintain_resolvers=$(mdata-get sdc:maintain_resolvers)
+maintain_result=$?
+if [[ ${maintain_result} != 0 ]]; then
+    echo "Error getting maintain_resolvers, code: ${maintain_result}"
+    maintain_resolvers="false"
+fi
+
+# If this is our first boot, write an initial set of resolvers
+if [[ -f /var/svc/provisioning ]]; then
+    echo "First boot: writing resolvers"
+    maintain_resolvers="true"
+fi
+
+if [[ ${resolvers_result} == 0 && ${maintain_resolvers} == "true" ]]; then
 
     # if dns_domain is missing or broken, we still write out, just w/o search
     search="search $(mdata-get sdc:dns_domain)"
@@ -187,70 +237,116 @@ if [[ ${result} == 0 ]]; then
         && cat /etc/.resolv.conf.tmp >&2 \
         && rm -f /etc/.resolv.conf.tmp
 else
-    echo "Error getting resolvers, code: ${result}"
+    if [[ ${resolvers_result} == 0 ]]; then
+        echo "Error getting resolvers, code: ${resolvers_result}"
+    fi
+
+    if [[ ${maintain_resolvers} == "true" ]]; then
+        echo "Not setting resolvers, maintain_resolvers=${maintain_resolvers}"
+    fi
 fi
+
 
 # Fetch routes
 
-rm -f /etc/inet/static_routes.{tmp,toadd,todelete}
+# It is possible to specify the same route in several different ways using
+# route(1m). We therefore use route(1m) itself to manage adding, deleting
+# and determining duplicates.
+zone_routes_file=/etc/inet/static_routes
+vmadm_routes_file=/etc/inet/static_routes.vmadm
+tmpdir=$(mktemp -d /tmp/mdata.XXXXXX)
+
+if [ -z $tmpdir ]; then
+    echo "Error creating temporary directory."
+    exit ${SMF_EXIT_ERR_FATAL}
+fi
+
+# directory structure for the new copy of static_routes.vmadm (the one that
+# will replace the current static_routes.vmadm once all of the adds and
+# deletes have been applied):
+new_root=${tmpdir}/new-routes
+new_inet=${new_root}/etc/inet
+# directory structure for the previous copy of static_routes.vmadm (used to
+# determine routes that have been removed since the last time mdata-fetch
+# was run):
+old_root=${tmpdir}/old-routes
+old_inet=${old_root}/etc/inet
+# directory structure for the zone's persistent routes - those not created
+# by vmadm (used to determine if vmadm routes are duplicates):
+zone_root=${tmpdir}/zone-routes
+zone_inet=${zone_root}/etc/inet
+
+mkdir -p $new_inet
+mkdir -p ${old_root}/etc/inet
+mkdir -p ${zone_root}/etc/inet
+
+if [[ -f ${vmadm_routes_file} ]]; then
+    cp $vmadm_routes_file ${old_inet}/static_routes
+fi
+
+function route_in_per_zone_file()
+{
+    cp $zone_routes_file $zone_inet
+    output=$(route -pR $zone_root add $* 2>&1)
+    [[ $output =~ "entry exists" ]]
+}
 
 # If re-running this script after initial boot, network/physical and
 # network/routing-setup are already enabled, so apply routing adds and
 # deletes manually
 if [[ $(/usr/bin/svcs -H -o state network/routing-setup) == "online" ]]; then
-  routing_up="true"
-  cp /etc/inet/static_routes{,.todelete}
+    routing_up="true"
 fi
-echo '# File generated by route(1M) - do not edit.' > \
-    /etc/inet/static_routes.tmp
 
 while IFS="|" read -r gateway dst linklocal; do
-  echo "route: gateway[${gateway}] dst[${dst}] linklocal[${linklocal}]"
-
-  if [[ -z ${gateway} ]] || [[ -z ${dst} ]]; then
-    continue;
-  fi
-
-  route_type=""
-  if [[ ${linklocal} == "true" ]]; then
-      route_type="-interface "
-  fi
-
-  echo "${route_type}${dst} ${gateway}" >> /etc/inet/static_routes.tmp
-  if [[ -n "${routing_up}" ]]; then
-    if ! grep "${dst} ${gateway}" /etc/inet/static_routes >/dev/null; then
-      echo "${route_type}${dst} ${gateway}" >> /etc/inet/static_routes.toadd
-    else
-      grep -v "${dst} ${gateway}" /etc/inet/static_routes.todelete > \
-        /etc/inet/static_routes.todelete.new
-      mv /etc/inet/static_routes.todelete{.new,}
+    echo "route: gateway[${gateway}] dst[${dst}] linklocal[${linklocal}]"
+    route_type=""
+    if [[ ${linklocal} == "true" ]]; then
+        route_type="-interface "
     fi
-  fi
+    route_str="${route_type}${dst} ${gateway}"
 
+    if route_in_per_zone_file $route_str; then
+        echo "not adding duplicate route: ${route_str}"
+        # the zone has also defined this route; do nothing
+    else
+        echo "adding route to file: ${route_str}"
+        route -pR $new_root add $route_str
+        if [[ -n "${routing_up}" ]]; then
+            route add $route_str
+        fi
+    fi
+
+    route -pR $old_root delete $route_str
 done < <(/usr/sbin/mdata-get sdc:routes \
     | /usr/bin/json -d '|' -a gateway dst linklocal)
 
 
-if [[ -n "${routing_up}" ]]; then
-  if [[ -f /etc/inet/static_routes.toadd ]]; then
-    echo "Adding persistent routes:"
-    /usr/bin/egrep -v "^(#|$)" /etc/inet/static_routes.toadd | \
-        while read line; do
-      /usr/sbin/route -p add $line
+# Anything left in the old static_routes file is a delete. Don't delete the
+# route from the routing tables if there's a duplicate route in the zone's
+# static_routes file
+if [[ -f ${old_inet}/static_routes ]]; then
+    egrep -v "^(#|$)" ${old_inet}/static_routes | while read -r route_str; do
+        if [[ "${route_str}" == "" ]]; then
+            continue
+        fi
+
+        if route_in_per_zone_file "$route_str"; then
+            echo "not deleting duplicate route: ${route_str}"
+        else
+            if [[ -n "${routing_up}" ]]; then
+                route delete $route_str
+            fi
+        fi
     done
-    rm /etc/inet/static_routes.toadd
-  fi
-  if [[ -f /etc/inet/static_routes.todelete ]]; then
-    echo "Deleting persistent routes:"
-    /usr/bin/egrep -v "^(#|$)" /etc/inet/static_routes.todelete | \
-        while read line; do
-      /usr/sbin/route -p delete $line
-    done
-    rm /etc/inet/static_routes.todelete
-  fi
 fi
 
-mv /etc/inet/static_routes{.tmp,}
+if [[ -f ${new_inet}/static_routes ]]; then
+    cp ${new_inet}/static_routes ${vmadm_routes_file}
+else
+    rm ${vmadm_routes_file}
+fi
+rm -rf $tmpdir
 
 
 # Unconditionally enable mdata:execute, so that the last provisioning step

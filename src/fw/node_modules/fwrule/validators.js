@@ -73,7 +73,7 @@ function validatePort(port) {
         return false;
     }
 
-    if (Number(port) > 65536) {
+    if (Number(port) > 65535) {
         return false;
     }
 
@@ -108,6 +108,33 @@ function validateAction(action) {
 
 
 /**
+ * Returns true if bool is a valid boolean value, false otherwise
+ */
+function validateBoolean(bool) {
+    if (typeof (bool) !== 'boolean' && bool !== 'true' && bool !== 'false') {
+        return false;
+    }
+
+    return true;
+}
+
+
+/**
+ * Throws an InvalidParamError if the string is invalid
+ */
+function validateString(name, str) {
+    if (typeof (str) !== 'string') {
+        throw new InvalidParamError(name, name + ' must be a string');
+    }
+
+    if (str.length > 255) {
+        throw new InvalidParamError(name,
+            name + ' must be shorter than 255 characters');
+    }
+}
+
+
+/**
  * Returns true if uuid is a valid UUID
  */
 function validateUUID(uuid) {
@@ -116,11 +143,13 @@ function validateUUID(uuid) {
 
 
 module.exports = {
+    bool: validateBoolean,
     InvalidParamError: InvalidParamError,
     validateAction: validateAction,
     validateIPv4address: validateIPv4address,
     validateIPv4subnet: validateIPv4subnet,
     validatePort: validatePort,
     validateProtocol: validateProtocol,
+    validateString: validateString,
     validateUUID: validateUUID
 };

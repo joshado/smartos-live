@@ -27,14 +27,20 @@
 
 var async = require('/usr/node/node_modules/async');
 var fs = require('fs');
-var fwLog = require('/usr/fw/lib/util/log');
+var fwlog = require('/usr/fw/lib/util/log');
 var VM = require('/usr/vm/node_modules/VM');
 var nopt = require('/usr/vm/node_modules/nopt');
 var onlyif = require('/usr/node/node_modules/onlyif');
-var panic = require('/usr/node/node_modules/panic');
 var sprintf = require('/usr/node/node_modules/sprintf').sprintf;
 var tty = require('tty');
 var util = require('util');
+var utils = require('/usr/vm/node_modules/utils');
+var properties = require('/usr/vm/node_modules/props');
+
+var draining_stdout_and_exiting = false;
+
+// pull in stuff from generated props (originating in proptable.js)
+var BRAND_OPTIONS = properties.BRAND_OPTIONS;
 
 VM.logname = 'vmadm';
 
@@ -53,6 +59,7 @@ var COMMANDS = [
     'install',
     'get', 'json',
     'list',
+    'kill',
     'lookup',
     'reboot',
     'receive', 'recv',
@@ -74,6 +81,7 @@ var LIST_FIELDS = {
     alias: {header: 'ALIAS', width: 10},
     autoboot: {header: 'AUTOBOOT', width: 8},
     billing_id: {header: 'BILLING_ID', width: 36},
+    boot_timestamp: {header: 'BOOT_TIMESTAMP', width: 24},
     brand: {header: 'BRAND', width: 14},
     cpu_cap: {header: 'CPU_CAP', width: 7},
     cpu_shares: {header: 'CPU_SHARE', width: 9},
@@ -81,8 +89,14 @@ var LIST_FIELDS = {
     create_timestamp: {header: 'CREATE_TIMESTAMP', width: 24},
     dns_domain: {header: 'DOMAIN', width: 32},
     do_not_inventory: {header: 'DNI', width: 5},
+    docker: {header: 'DOCKER', width: 6},
+    exit_status: {header: 'EXIT', width: 4},
+    exit_timestamp: {header: 'EXIT_TIMESTAMP', width: 24},
+    firewall_enabled: {header: 'FIREWALL_ENABLED', width: 16},
     hostname: {header: 'HOSTNAME', width: 32},
     image_uuid: {header: 'IMAGE_UUID', width: 36},
+    indestructible_delegated: {header: 'INDESTR_DATA', width: 12},
+    indestructible_zoneroot: {header: 'INDESTR_ROOT', width: 12},
     ram: {header: 'RAM', width: 7},
     max_locked_memory: {header: 'MAX_LOCKED', width: 10},
     max_lwps: {header: 'MAX_LWP', width: 7},
@@ -138,6 +152,7 @@ function usage(message, code)
     out('get <uuid>');
     out('info <uuid> [type,...]');
     out('install <uuid>');
+    out('kill [-s SIGNAL|-SIGNAL] <uuid>');
     out('list [-p] [-H] [-o field,...] [-s field,...] [field=value ...]');
     out('lookup [-j|-1] [-o field,...] [field=value ...]');
     out('reboot <uuid> [-F]');
@@ -392,6 +407,10 @@ function addCommandOptions(command, opts, shorts)
         opts.unique = Boolean;
         shorts['1'] = ['--unique'];
         break;
+    case 'kill':
+        opts.signal = String;
+        shorts.s = ['--signal'];
+        break;
     case 'create':
     case 'receive':
     case 'recv':
@@ -458,11 +477,20 @@ function startVM(uuid, extra, callback)
 
 function addFakeFields(m)
 {
-    if (m.brand === 'kvm') {
-        m.type = 'KVM';
+    if (BRAND_OPTIONS[m.brand]
+        && BRAND_OPTIONS[m.brand].features
+        && BRAND_OPTIONS[m.brand].features.type) {
+
+        m.type = BRAND_OPTIONS[m.brand].features.type;
     } else {
-        m.ram = m.max_physical_memory;
+        // When we don't know 'type', treat as OS VM
         m.type = 'OS';
+    }
+
+    if (m.brand !== 'kvm') {
+        // when we do not normally have 'ram', set as fake property for
+        // consistency
+        m.ram = m.max_physical_memory;
     }
 }
 
@@ -517,6 +545,7 @@ function outputVMListLine(order_fields, m, options)
 {
     var args = [];
     var field;
+    var flat;
     var fmt = '';
     var output;
     var value;
@@ -534,12 +563,15 @@ function outputVMListLine(order_fields, m, options)
         if (!m) {
             // This is special case to just write the header.
             value = getListProperties(field).header;
-        } else if (VM.flatten(m, field)) {
-            value = VM.flatten(m, field).toString();
-        } else if (options.parsable) {
-            value = '';
         } else {
-            value = '-';
+            flat = VM.flatten(m, field);
+            if (flat || flat === 0) {
+                value = flat.toString();
+            } else if (options.parsable) {
+                value = '';
+            } else {
+                value = '-';
+            }
         }
 
         if (options.parsable) {
@@ -630,18 +662,6 @@ function listVM(spec, order, sortby, options, callback)
 
     fields = order.split(',');
 
-    // some fields are added by addFakeFields and not real lookup fields
-    // lookup will return these because of the transform we pass in, but
-    // we need to also add the stuff transform needs to get these.
-    if (fields.indexOf('type') !== -1) {
-        if (fields.indexOf('brand') === -1) {
-            fields.push('brand');
-        }
-    }
-    if (fields.indexOf('ram') !== -1) {
-        fields.push('max_physical_memory');
-    }
-
     // not all fields we're passed as order are looked up directly. When you
     // want nics.0.ip for example, we just request the whole .nics object.
     fields.forEach(function (field) {
@@ -709,11 +729,13 @@ function main(callback)
     var order_list;
     var parsed;
     var shortHands = {};
+    var signal;
     var snapname;
     var sortby;
     var sortby_list;
     var type;
     var types;
+    var unexpected_args = [];
     var uuid;
 
     if (!command) {
@@ -775,6 +797,8 @@ function main(callback)
 
             VM.reprovision(uuid, payload, function (e) {
                 if (e) {
+                    e.message = 'Failed to reprovision VM ' + uuid + ': '
+                        + e.message;
                     callback(e);
                 } else {
                     callback(null, 'Successfully reprovisioned VM ' + uuid);
@@ -1011,6 +1035,9 @@ function main(callback)
         } else if (parsed.hasOwnProperty('output')) {
             callback(new Error('Cannot specify -o without -j'));
             return;
+        } else {
+            // not JSON output, just a list of uuids.
+            options.fields = ['uuid'];
         }
 
         for (key in extra) {
@@ -1035,7 +1062,7 @@ function main(callback)
                 // of uuids.
                 for (m in results) {
                     m = results[m];
-                    console.log(m);
+                    console.log(m.uuid);
                 }
             }
         });
@@ -1106,6 +1133,59 @@ function main(callback)
 
         listVM(extra, order, sortby, options, callback);
         break;
+    case 'kill':
+        if (parsed.hasOwnProperty('signal')) {
+            // the '-s <signal>' case
+            signal = parsed.signal;
+            uuid = getUUID(command, parsed);
+        } else if ((parsed.argv.remain.length === 1)
+            && (utils.isUUID(parsed.argv.remain[0]))) {
+
+            // When we just call 'vmadm kill <uuid>' the default is SIGTERM
+            signal = 'SIGTERM';
+            uuid = parsed.argv.remain.shift();
+        } else {
+            // here we're looking for '-SIGNAL <UUID>'
+            Object.keys(parsed).forEach(function (k) {
+                // Skip the built-in argv argument
+                if (k === 'argv') {
+                    return;
+                }
+                // if we already found a uuid or if the argument to this option
+                // is not a uuid (eg. -9 <uuid>) then it's definitely unexpected
+                if (uuid || !utils.isUUID(parsed[k])) {
+                    unexpected_args.push(k);
+                    return;
+                }
+                signal = k;
+                uuid = parsed[k];
+            });
+
+            if (unexpected_args.length > 0) {
+                usage('Unexpected args: ' + JSON.stringify(unexpected_args));
+                break;
+            }
+        }
+
+        if (parsed.argv.remain.length > 0) {
+            usage('Too many arguments.');
+            break;
+        }
+
+        if (!utils.isUUID(uuid)) {
+            usage('Invalid or missing argument UUID');
+            break;
+        }
+
+        VM.kill(uuid, {signal: signal}, function (err) {
+            if (err) {
+                callback(err);
+            } else {
+                callback(null, 'Sent signal "' + signal + '" to init process '
+                    + 'for VM ' + uuid);
+            }
+        });
+        break;
     case 'halt':
         command = 'stop';
         /*jsl:fallthru*/
@@ -1136,46 +1216,103 @@ function main(callback)
     }
 }
 
-function flushLogs(callback)
-{
-    var streams;
-
-    if (!VM.log) {
-        fwLog.flush(callback);
+/**
+ * Flush all open log streams
+ */
+function flushLogs(logs, callback) {
+    if (!logs) {
+        callback();
         return;
     }
 
-    streams = VM.log.streams;
-    async.forEachSeries(streams, function (str, cb) {
-        var called_back = false;
+    var streams = [];
+    if (!util.isArray(logs)) {
+        logs = [ logs ];
+    }
 
+    if (logs.length === 0) {
+        callback();
+        return;
+    }
+
+    logs.forEach(function (log) {
+        if (!log || !log.streams || log.streams.length === 0) {
+            return;
+        }
+
+        streams = streams.concat(log.streams);
+    });
+
+    var toClose = streams.length;
+    var closed = 0;
+
+    function _doneClose() {
+        closed++;
+        if (closed == toClose) {
+            callback();
+            return;
+        }
+    }
+
+    streams.forEach(function (str) {
         if (!str || !str.stream) {
-            cb();
+            _doneClose();
             return;
         }
 
         str.stream.once('drain', function () {
-            if (!called_back) {
-                called_back = true;
-                cb();
-            }
+            _doneClose();
         });
 
         if (str.stream.write('')) {
-            // according to node docs true here means we're done
-            if (!called_back) {
-                called_back = true;
-                cb();
-            }
-        } else {
-            // false means: wait for 'drain' to call cb();
-            /*jsl:pass*/
+            _doneClose();
         }
-        return;
-    }, function () {
-        fwLog.flush(callback);
-        return;
     });
+}
+
+process.stdout.on('error', function (err) {
+    if (err.code === 'EPIPE') {
+        // See <https://github.com/trentm/json/issues/9>.
+        drainStdoutAndExit(0);
+    } else {
+        console.warn(err.message);
+        drainStdoutAndExit(1);
+    }
+});
+
+/**
+ *
+ * This function is a modified version of the one from Trent Mick's excellent
+ * jsontool at:
+ *
+ *  https://github.com/trentm/json
+ *
+ * A hacked up version of "process.exit" that will first drain stdout
+ * before exiting. *WARNING: This doesn't stop event processing.* IOW,
+ * callers have to be careful that code following this call isn't
+ * accidentally executed.
+ *
+ * In node v0.6 "process.stdout and process.stderr are blocking when they
+ * refer to regular files or TTY file descriptors." However, this hack might
+ * still be necessary in a shell pipeline.
+ */
+function drainStdoutAndExit(code) {
+    var flushed;
+
+    if (draining_stdout_and_exiting) {
+        // only want drainStdoutAndExit() run once
+        return;
+    }
+    draining_stdout_and_exiting = true;
+
+    process.stdout.on('drain', function () {
+        process.exit(code);
+    });
+
+    flushed = process.stdout.write('');
+    if (flushed) {
+        process.exit(code);
+    }
 }
 
 onlyif.rootInSmartosGlobal(function (err) {
@@ -1185,22 +1322,26 @@ onlyif.rootInSmartosGlobal(function (err) {
         return;
     }
 
-    panic.enablePanicOnCrash({
-        'skipDump': true,
-        'abortOnPanic': true
-    });
-
     main(function (e, message) {
+        var logs = [];
+
+        if (VM.log) {
+            logs.push(VM.log);
+        }
+        if (VM.fw_log) {
+            logs.push(VM.fw_log);
+        }
+
         if (e) {
             console.error(e.message);
-            flushLogs(function () {
+            flushLogs(logs, function () {
                 process.exit(1);
             });
         } else {
             if (message) {
                 console.error(message);
             }
-            flushLogs(function () {
+            flushLogs(logs, function () {
                 process.exit(0);
             });
         }

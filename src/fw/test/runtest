@@ -1,7 +1,13 @@
 #!/bin/bash
 
+UNAME=$(uname -s)
 NODE=node
-NODEUNIT="test/node_modules/nodeunit/bin/nodeunit"
+TOP=$(unset CDPATH; cd $(dirname $0)/../; pwd)
+NODEUNIT="${TOP}/test/node_modules/nodeunit/bin/nodeunit"
+
+if [[ $UNAME == "SunOS" ]]; then
+    NODE=/usr/node/0.10/bin/node
+fi
 
 function usage
 {
@@ -31,6 +37,16 @@ do
             ;;
     esac
 done
+
+if [[ $UNAME == "SunOS" ]]; then
+    echo "# Adding images.joyent.com as an imgadm source"
+    imgadm sources -a "https://images.joyent.com/"
+
+    for IMG in $(/usr/node/bin/node -e "console.log(require('/usr/fw/test/lib/vm').imageUUIDs.join(' '));"); do
+        echo "# Installing required image $IMG"
+        imgadm import $IMG
+    done
+fi
 
 shift $(($OPTIND - 1))
 $NODE $NODEUNIT --reporter $opt_reporter $1

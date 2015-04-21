@@ -20,12 +20,13 @@
  *
  * CDDL HEADER END
  *
- * Copyright (c) 2013, Joyent, Inc. All rights reserved.
+ * Copyright (c) 2014, Joyent, Inc. All rights reserved.
  *
  * * *
- * Some base imgadm tests.
+ * Some basic imgadm tests.
  */
 
+var p = console.log;
 var format = require('util').format;
 var exec = require('child_process').exec;
 
@@ -39,16 +40,39 @@ var before = tap4nodeunit.before;
 var test = tap4nodeunit.test;
 
 
-var IMGADM = 'imgadm';
+function objCopy(obj, target) {
+    if (!target) {
+        target = {};
+    }
+    Object.keys(obj).forEach(function (k) {
+        target[k] = obj[k];
+    });
+    return target;
+}
 
 
-before(function (next) {
-    next();
+test('imgadm', function (t) {
+    exec('imgadm', function (err, stdout, stderr) {
+        t.ok(err);
+        t.equal(stderr, '', 'stderr');
+        t.ok(/\nUsage:/.test(stdout), 'stdout has help');
+        t.end();
+    });
+});
+
+test('imgadm -E', function (t) {
+    exec('imgadm -E', function (err, stdout, stderr) {
+        t.ok(err);
+        var lines = stderr.trimRight().split(/\n/g);
+        structuredErr = JSON.parse(lines[lines.length - 1]);
+        t.equal(structuredErr.err.code, 'NoCommand');
+        t.end();
+    });
 });
 
 
 test('imgadm --version', function (t) {
-    exec(IMGADM + ' --version', function (err, stdout, stderr) {
+    exec('imgadm --version', function (err, stdout, stderr) {
         t.ifError(err, err);
         t.equal(stderr, '', 'stderr');
         t.ok(/^imgadm \d+\.\d+\.\d+/.test(stdout),
@@ -60,9 +84,9 @@ test('imgadm --version', function (t) {
     });
 });
 
-['', ' --help', ' -h', ' help'].forEach(function (args) {
+[' --help', ' -h', ' help'].forEach(function (args) {
     test('imgadm' + args, function (t) {
-        exec(IMGADM + args, function (err, stdout, stderr) {
+        exec('imgadm' + args, function (err, stdout, stderr) {
             t.ifError(err, err);
             t.equal(stderr, '', 'stderr');
             t.ok(/\nUsage:/.test(stdout), 'stdout has help');
@@ -72,11 +96,8 @@ test('imgadm --version', function (t) {
 });
 
 
-test('imgadm -vv   # bunyan debug log on stderr', function (t) {
-    exec(IMGADM + ' -vv bogus', function (err, stdout, stderr) {
-        t.ok(err);
-        t.equal(err.code, 1);
-        t.equal(stdout, '', 'stdout');
+test('imgadm -v list  # bunyan trace log on stderr', function (t) {
+    exec('imgadm -v list', function (err, stdout, stderr) {
         t.ok(stderr);
         var firstLine = stderr.split(/\n/g)[0];
         var record = JSON.parse(firstLine);
@@ -86,8 +107,11 @@ test('imgadm -vv   # bunyan debug log on stderr', function (t) {
     });
 });
 
-test('imgadm -vvv   # bunyan "src" log on stderr', function (t) {
-    exec(IMGADM + ' -vvv bogus', function (err, stdout, stderr) {
+test('IMGADM_LOG_LEVEL=trace imgadm   # bunyan "src" log on stderr', function (t) {
+    var env = objCopy(process.env);
+    env.IMGADM_LOG_LEVEL = 'trace';
+    var execOpts = {env: env};
+    exec('imgadm bogus', execOpts, function (err, stdout, stderr) {
         t.ok(err);
         t.equal(err.code, 1);
         t.equal(stdout, '', 'stdout');
@@ -104,7 +128,7 @@ test('imgadm -vvv   # bunyan "src" log on stderr', function (t) {
 
 
 test('imgadm -E -vv   # structured error last line', function (t) {
-    exec(IMGADM + ' -E -vv bogus', function (err, stdout, stderr) {
+    exec('imgadm -E -vv bogus', function (err, stdout, stderr) {
         t.ok(err);
         t.equal(err.code, 1);
         t.equal(stdout, '', 'stdout');
@@ -127,7 +151,7 @@ test('imgadm -E -vv   # structured error last line', function (t) {
 
 
 test('imgadm help sources', function (t) {
-    exec(IMGADM + ' help sources', function (err, stdout, stderr) {
+    exec('imgadm help sources', function (err, stdout, stderr) {
         t.ifError(err, err);
         t.equal(stderr, '', 'stderr');
         t.ok(/imgadm sources/.test(stdout),
@@ -140,7 +164,7 @@ test('imgadm help sources', function (t) {
 
 var BOGUS_UUID = '29fa922a-7fa7-11e2-bffa-5b6fe63a8d5e';
 test('`imgadm info BOGUS_UUID` ImageNotInstalled error, rv 3', function (t) {
-    exec(IMGADM + ' info ' + BOGUS_UUID, function (err, stdout, stderr) {
+    exec('imgadm info ' + BOGUS_UUID, function (err, stdout, stderr) {
         t.ok(err, err);
         t.equal(err.code, 3);
         t.ok(/ImageNotInstalled/.test(stderr),

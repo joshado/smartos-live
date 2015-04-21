@@ -1,6 +1,9 @@
+// vim: set ts=4 sts=4 sw=4 et:
+var assert = require('assert');
 var VM  = require('/usr/vm/node_modules/VM');
 var ZWatch = require('./zwatch');
 var common = require('./common');
+var crc32 = require('./crc32');
 var async = require('/usr/node/node_modules/async');
 var execFile = require('child_process').execFile;
 var fs = require('fs');
@@ -25,8 +28,10 @@ var sdc_fields = [
     'force_metadata_socket',
     'fs_allowed',
     'hostname',
+    'internal_metadata_namespaces',
     'limit_priv',
     'last_modified',
+    'maintain_resolvers',
     'max_physical_memory',
     'max_locked_memory',
     'max_lwps',
@@ -48,11 +53,13 @@ var sdc_fields = [
     'zonepath',
     'zonename'
 ];
+var MAX_RETRY = 300; // in seconds
 
 var MetadataAgent = module.exports = function (options) {
     this.log = options.log;
     this.zlog = {};
     this.zones = {};
+    this.zoneRetryTimeouts = {};
     this.zoneConnections = {};
 };
 
@@ -228,6 +235,8 @@ MetadataAgent.prototype.start = function () {
             });
         } else if (msg.cmd === 'stop') {
             if (self.zoneConnections[msg.zonename]) {
+                self.log.trace('saw zone ' + msg.zonename
+                    + ' stop, calling end()');
                 self.zoneConnections[msg.zonename].end();
             }
         }
@@ -332,7 +341,13 @@ function (zonename, callback) {
     var zlog = self.zlog[zonename];
     var zonePath = self.zones[zonename].zonepath;
     var localpath = '/.zonecontrol';
-    var zonecontrolpath = path.join(zonePath, 'root', localpath);
+    var zonecontrolpath;
+
+    if (self.zones[zonename].brand === 'lx') {
+        localpath = '/native' + localpath;
+    }
+
+    zonecontrolpath = path.join(zonePath, 'root', localpath);
 
     zlog.info('Starting socket server');
 
@@ -361,10 +376,8 @@ function (zonename, callback) {
             return;
         }
 
-        self.createZoneSocket(zopts, function (createErr) {
+        self.createZoneSocket(zopts, undefined, function (createErr) {
             if (createErr) {
-                zlog.error({err: createErr}, 'createZoneSocket Error: '
-                    + createErr.message);
                 // We call callback here, but don't include the error because
                 // this is running in async.forEach and we don't want to fail
                 // the others and there's nothing we can do to recover anyway.
@@ -383,18 +396,64 @@ function (zonename, callback) {
     });
 };
 
-MetadataAgent.prototype.createZoneSocket = function (zopts, callback) {
-    var self = this;
+/*
+ * waitSecs here indicates how long we should wait to retry after this attempt
+ * if we fail.
+ */
+function attemptCreateZoneSocket(self, zopts, waitSecs) {
     var zlog = self.zlog[zopts.zone];
 
-    zsock.createZoneSocket(zopts, function (error, fd) {
-        if (error) {
-            throw error;
+    if (!zlog) {
+        // if there's no zone-specific logger, use the global one
+        zlog = self.log;
+    }
+
+    zlog.debug('attemptCreateZoneSocket(): zone: %s, wait: %d', zopts.zone,
+        waitSecs);
+
+    function _retryCreateZoneSocketLater() {
+        if (self.zoneRetryTimeouts[zopts.zone]) {
+            zlog.error('_retryCreateZoneSocketLater(): already have a retry '
+                + 'running, not starting another one.');
+            return;
         }
 
-        var server = net.createServer(function (socket) {
+        zlog.info('Will retry zsock creation for %s in %d seconds',
+            zopts.zone, waitSecs);
+
+        self.zoneRetryTimeouts[zopts.zone] = setTimeout(function () {
+            var nextRetry = waitSecs * 2;
+
+            if (nextRetry > MAX_RETRY) {
+                nextRetry = MAX_RETRY;
+            }
+
+            zlog.info('Retrying %s', zopts.zone);
+            self.zoneRetryTimeouts[zopts.zone] = null;
+            process.nextTick(function () {
+                attemptCreateZoneSocket(self, zopts, nextRetry);
+            });
+        }, waitSecs * 1000);
+    }
+
+    zsock.createZoneSocket(zopts, function (error, fd) {
+        var server;
+
+        if (error) {
+            // If we get errors trying to create the zone socket, setup a retry
+            // loop and return.
+            zlog.error({err: error}, 'createZoneSocket error, %s seconds before'
+                + ' next attempt', waitSecs);
+            _retryCreateZoneSocketLater();
+            return;
+        }
+
+        server = net.createServer(function (socket) {
             var handler = self.makeMetadataHandler(zopts.zone, socket);
             var buffer = '';
+
+            zlog.trace('creating new server for FD ' + fd);
+
             socket.on('data', function (data) {
                 var chunk, chunks;
                 buffer += data.toString();
@@ -412,35 +471,74 @@ MetadataAgent.prototype.createZoneSocket = function (zopts, callback) {
                     + 'socket and server.');
                 try {
                     server.close();
+                    socket.end();
                 } catch (e) {
-                    zlog.error({err: e}, 'Caught exception closing server: '
-                        + e.message);
+                    zlog.error({err: e}, 'Caught exception closing server: %s',
+                        e.message);
                 }
-
-                socket.end();
-                self.createZoneSocket(zopts);
+                _retryCreateZoneSocketLater();
+                return;
             });
         });
+
+        /*
+         * When we create a new zoneConnections entry, we want to make sure if
+         * there's an existing one (due to an error that we're retrying for
+         * example) that we clear the existing one and its timeout before
+         * creating a new one.
+         */
+        zlog.trace('creating new zoneConnections[' + zopts.zone + ']');
+        if (self.zoneConnections[zopts.zone]
+            && !self.zoneConnections[zopts.zone].done) {
+
+            self.log.trace('creating new connection for ' + zopts.zone
+                + ', but existing zoneConnection exists, calling end()');
+            self.zoneConnections[zopts.zone].end();
+        }
 
         self.zoneConnections[zopts.zone] = {
             conn: server,
             done: false,
             end: function () {
+                if (self.zoneRetryTimeouts[zopts.zone]) {
+                    // When .end() is called, want to stop any existing retries
+                    clearTimeout(self.zoneRetryTimeouts[zopts.zone]);
+                    self.zoneRetryTimeouts[zopts.zone] = null;
+                }
                 if (this.done) {
+                    zlog.trace(zopts.zone + ' ' + fd + ' already done, not '
+                        + 'closing again.');
                     return;
                 }
                 this.done = true;
                 zlog.info('Closing server');
-                server.close();
+                try {
+                    server.close();
+                } catch (e) {
+                    zlog.error({err: e}, 'Caught exception closing server: '
+                        + e.message);
+                }
             }
         };
 
-        server.on('error', function (e) {
-            zlog.error({err: e}, 'Zone socket error: ' + e.message);
-            if (e.code !== 'EINTR') {
-                throw e;
+        server.on('error', function (err) {
+            zlog.error({err: err}, 'Zone socket error: %s', err.message);
+            if (err.code === 'ENOTSOCK' || err.code === 'EBADF') {
+                // the socket inside the zone went away,
+                // likely due to resource constraints (ie: disk full)
+                try {
+                    server.close();
+                } catch (e) {
+                    zlog.error({err: e}, 'Caught exception closing server: '
+                        + e.message);
+                }
+                // start the retry timer
+                _retryCreateZoneSocketLater();
+            } else if (err.code !== 'EINTR') {
+                throw err;
             }
         });
+
         var Pipe = process.binding('pipe_wrap').Pipe;
         var p = new Pipe(true);
         p.open(fd);
@@ -449,11 +547,51 @@ MetadataAgent.prototype.createZoneSocket = function (zopts, callback) {
 
         server.listen();
     });
+}
+
+MetadataAgent.prototype.createZoneSocket =
+function (zopts, waitSecs, callback) {
+    var self = this;
+    waitSecs = waitSecs || 1;
+
+    attemptCreateZoneSocket(self, zopts, waitSecs);
 
     if (callback) {
         callback();
     }
 };
+
+function base64_decode(input) {
+    try {
+        return (new Buffer(input, 'base64')).toString();
+    } catch (err) {
+        return null;
+    }
+}
+
+function internalNamespace(vmobj, want)
+{
+    var internal_namespace = null;
+    var prefix;
+
+    /*
+     * If we have a ':' we need to check against namespaces. If it is in the
+     * list, we're dealing with read-only internal_metadata instead of
+     * customer_metadata.
+     */
+    if ((want.indexOf(':') !== -1)
+        && vmobj.hasOwnProperty('internal_metadata_namespaces')) {
+
+        prefix = (want.split(':'))[0];
+        vmobj.internal_metadata_namespaces.forEach(function (ns) {
+            if (ns === prefix) {
+                internal_namespace = prefix;
+            }
+        });
+    }
+
+    return (internal_namespace);
+}
 
 MetadataAgent.prototype.makeMetadataHandler = function (zone, socket) {
     var self = this;
@@ -469,10 +607,13 @@ MetadataAgent.prototype.makeMetadataHandler = function (zone, socket) {
 
     return function (data) {
         var cmd;
+        var ns;
         var parts;
         var val;
         var vmobj;
         var want;
+        var reqid;
+        var req_is_v2 = false;
 
         parts = rtrim(data.toString()).replace(/\n$/, '')
             .match(/^([^\s]+)\s?(.*)/);
@@ -485,15 +626,28 @@ MetadataAgent.prototype.makeMetadataHandler = function (zone, socket) {
         cmd = parts[1];
         want = parts[2];
 
-        if (cmd === 'GET' && !want) {
+        if ((cmd === 'NEGOTIATE' || cmd === 'GET') && !want) {
             write('invalid command\n');
             return;
         }
 
         vmobj = self.zones[zone];
 
+        // Unbox V2 protocol frames:
+        if (cmd === 'V2') {
+            if (!parse_v2_request(want))
+                return;
+        }
+
         if (cmd === 'GET') {
-            zlog.info('Serving ' + want);
+            want = (want || '').trim();
+            if (!want) {
+                returnit(new Error('Invalid GET Request'));
+                return;
+            }
+
+            zlog.info('Serving GET ' + want);
+
             if (want.slice(0, 4) === 'sdc:') {
                 want = want.slice(4);
 
@@ -503,20 +657,31 @@ MetadataAgent.prototype.makeMetadataHandler = function (zone, socket) {
                 // that depends on it, please add a note about that here
                 // otherwise expect it will be removed on you sometime.
                 if (want === 'nics' && vmobj.hasOwnProperty('nics')) {
-                    val = JSON.stringify(vmobj.nics);
-                    returnit(null, val);
-                    return;
+                    self.updateZone(zone, function () {
+                        val = JSON.stringify(vmobj.nics);
+                        returnit(null, val);
+                        return;
+                    });
                 } else if (want === 'resolvers'
                     && vmobj.hasOwnProperty('resolvers')) {
 
-                    // resolvers and routes are special because we might reload
-                    // metadata trying to get the new ones w/o zone reboot. To
-                    // ensure these are fresh we always run updateZone which
-                    // reloads the data if stale.
+                    // resolvers, nics and routes are special because we might
+                    // reload metadata trying to get the new ones w/o zone
+                    // reboot. To ensure these are fresh we always run
+                    // updateZone which reloads the data if stale.
                     self.updateZone(zone, function () {
                         // See NOTE above about nics, same applies to resolvers.
                         // It's here solely for the use of mdata-fetch.
                         val = JSON.stringify(self.zones[zone].resolvers);
+                        returnit(null, val);
+                        return;
+                    });
+                } else if (want === 'tmpfs'
+                    && vmobj.hasOwnProperty('tmpfs')) {
+                    // We want tmpfs to reload the cache right away because we
+                    // might be depending on a /etc/vfstab update
+                    self.updateZone(zone, function () {
+                        val = JSON.stringify(self.zones[zone].tmpfs);
                         returnit(null, val);
                         return;
                     });
@@ -562,6 +727,18 @@ MetadataAgent.prototype.makeMetadataHandler = function (zone, socket) {
                         returnit(null, JSON.stringify(vmRoutes));
                         return;
                     });
+                } else if (want === 'operator-script') {
+                    addMetadata(function (err) {
+                        if (err) {
+                            returnit(new Error('Unable to load metadata: '
+                                + err.message));
+                            return;
+                        }
+
+                        returnit(null,
+                            vmobj.internal_metadata['operator-script']);
+                        return;
+                    });
                 } else {
                     addTags(function (err) {
                         if (!err) {
@@ -586,6 +763,10 @@ MetadataAgent.prototype.makeMetadataHandler = function (zone, socket) {
                         which_mdata = 'internal_metadata';
                     }
 
+                    if (internalNamespace(vmobj, want) !== null) {
+                        which_mdata = 'internal_metadata';
+                    }
+
                     if (vmobj.hasOwnProperty(which_mdata)) {
                         returnit(null, vmobj[which_mdata][want]);
                         return;
@@ -596,6 +777,87 @@ MetadataAgent.prototype.makeMetadataHandler = function (zone, socket) {
                     }
                 });
             }
+        } else if (!req_is_v2 && cmd === 'NEGOTIATE') {
+            if (want === 'V2') {
+                write('V2_OK\n');
+            } else {
+                write('FAILURE\n');
+            }
+            return;
+        } else if (req_is_v2 && cmd === 'DELETE') {
+            want = (want || '').trim();
+            if (!want) {
+                returnit(new Error('Invalid DELETE Request'));
+                return;
+            }
+
+            zlog.info('Serving DELETE ' + want);
+
+            if (want.slice(0, 4) === 'sdc:') {
+                returnit(new Error('Cannot update the "sdc" Namespace.'));
+                return;
+            }
+
+            ns = internalNamespace(vmobj, want);
+            if (ns !== null) {
+                returnit(new Error('Cannot update the "' + ns
+                    + '" Namespace.'));
+                return;
+            }
+
+            setMetadata(want, null, function (err) {
+                if (err) {
+                    returnit(err);
+                } else {
+                    returnit(null, 'OK');
+                }
+            });
+        } else if (req_is_v2 && cmd === 'PUT') {
+            var key;
+            var value;
+            var terms;
+
+            terms = (want || '').trim().split(' ');
+
+            if (terms.length !== 2) {
+                returnit(new Error('Invalid PUT Request'));
+                return;
+            }
+
+            // PUT requests have two space-separated BASE64-encoded
+            // arguments: the Key and then the Value.
+            key = (base64_decode(terms[0]) || '').trim();
+            value = base64_decode(terms[1]);
+
+            if (!key || value === null) {
+                returnit(new Error('Invalid PUT Request'));
+                return;
+            }
+
+            if (key.slice(0, 4) === 'sdc:') {
+                returnit(new Error('Cannot update the "sdc" Namespace.'));
+                return;
+            }
+
+            ns = internalNamespace(vmobj, key);
+            if (ns !== null) {
+                returnit(new Error('Cannot update the "' + ns
+                    + '" Namespace.'));
+                return;
+            }
+
+            zlog.info('Serving PUT ' + key);
+            setMetadata(key, value, function (err) {
+                if (err) {
+                    zlog.error(err, 'could not set metadata (key "' + key
+                        + '")');
+                    returnit(err);
+                } else {
+                    returnit(null, 'OK');
+                }
+            });
+
+            return;
         } else if (cmd === 'KEYS') {
             addMetadata(function (err) {
                 var ckeys = [];
@@ -607,17 +869,22 @@ MetadataAgent.prototype.makeMetadataHandler = function (zone, socket) {
                     return;
                 }
 
-                // *_pw$ keys come from internal_metadata, everything else comes
-                // from customer_metadata
+                /*
+                 * Keys that match *_pw$ and internal_metadata_namespace
+                 * prefixed keys come from internal_metadata, everything else
+                 * comes from customer_metadata.
+                 */
                 ckeys = Object.keys(vmobj.customer_metadata)
                     .filter(function (k) {
 
-                    return (!k.match(/_pw$/));
+                    return (!k.match(/_pw$/)
+                        && internalNamespace(vmobj, k) === null);
                 });
                 ikeys = Object.keys(vmobj.internal_metadata)
                     .filter(function (k) {
 
-                    return (k.match(/_pw$/));
+                    return (k.match(/_pw$/)
+                        || internalNamespace(vmobj, k) !== null);
                 });
 
                 returnit(null, ckeys.concat(ikeys).join('\n'));
@@ -710,31 +977,132 @@ MetadataAgent.prototype.makeMetadataHandler = function (zone, socket) {
             });
         }
 
+        function setMetadata(_key, _value, cb) {
+            var payload = {};
+            var which = 'customer_metadata';
+
+            // Some keys come from "internal_metadata":
+            if (_key.match(/_pw$/) || _key === 'operator-script') {
+                which = 'internal_metadata';
+            }
+
+            // Construct payload for VM.update()
+            if (_value) {
+                payload['set_' + which] = {};
+                payload['set_' + which][_key] = _value;
+            } else {
+                payload['remove_' + which] = [ _key ];
+            }
+
+            zlog.trace({ payload: payload }, 'calling VM.update()');
+            VM.update(vmobj.uuid, payload, zlog, cb);
+        }
+
+        function parse_v2_request(inframe) {
+            var m;
+            var m2;
+            var newcrc32;
+            var framecrc32;
+            var clen;
+
+            zlog.trace({ request: inframe }, 'incoming V2 request');
+
+            m = inframe.match(
+                /\s*([0-9]+)\s+([0-9a-f]+)\s+([0-9a-f]+)\s+(.*)/);
+            if (!m) {
+                zlog.error('V2 frame did not parse: ', inframe);
+                return (false);
+            }
+
+            clen = Number(m[1]);
+            if (!(clen > 0) || clen !== (m[3] + ' ' + m[4]).length) {
+                zlog.error('V2 invalid clen: ' + m[1]);
+                return (false);
+            }
+
+            newcrc32 = crc32.crc32_calc(m[3] + ' ' + m[4]);
+            framecrc32 = m[2];
+            if (framecrc32 !== newcrc32) {
+                zlog.error('V2 crc mismatch (ours ' + newcrc32
+                    + ' theirs ' + framecrc32 + '): ' + want);
+                return (false);
+            }
+
+            reqid = m[3];
+
+            m2 = m[4].match(/\s*(\S+)\s*(.*)/);
+            if (!m2) {
+                zlog.error('V2 invalid body: ' + m[4]);
+                return (false);
+            }
+
+            cmd = m2[1];
+            want = base64_decode(m2[2]);
+
+            req_is_v2 = true;
+
+            return (true);
+        }
+
+
+        function format_v2_response(code, body) {
+            var resp;
+            var fullresp;
+
+            resp = reqid + ' ' + code;
+            if (body)
+                resp += ' ' + (new Buffer(body).toString('base64'));
+
+            fullresp = 'V2 ' + resp.length + ' ' + crc32.crc32_calc(
+                resp) + ' ' + resp + '\n';
+
+            zlog.trace({ response: fullresp }, 'formatted V2 response');
+
+            return (fullresp);
+        }
+
         function returnit(error, retval) {
             var towrite;
 
             if (error) {
                 zlog.error(error.message);
-                write('FAILURE\n');
+                if (req_is_v2)
+                    write(format_v2_response('FAILURE', error.message));
+                else
+                    write('FAILURE\n');
                 return;
             }
 
             // String value
             if (common.isString(retval)) {
-                towrite = retval.replace(/^\./mg, '..');
-                write('SUCCESS\n' + towrite + '\n.\n');
+                if (req_is_v2) {
+                    write(format_v2_response('SUCCESS', retval));
+                } else {
+                    towrite = retval.replace(/^\./mg, '..');
+                    write('SUCCESS\n' + towrite + '\n.\n');
+                }
                 return;
             } else if (!isNaN(retval)) {
-                towrite = retval.toString().replace(/^\./mg, '..');
-                write('SUCCESS\n' + towrite + '\n.\n');
+                if (req_is_v2) {
+                    write(format_v2_response('SUCCESS', retval.toString()));
+                } else {
+                    towrite = retval.toString().replace(/^\./mg, '..');
+                    write('SUCCESS\n' + towrite + '\n.\n');
+                }
                 return;
             } else if (retval) {
                 // Non-string value
-                write('FAILURE\n');
+                if (req_is_v2)
+                    write(format_v2_response('FAILURE'));
+                else
+                    write('FAILURE\n');
                 return;
             } else {
                 // Nothing to return
-                write('NOTFOUND\n');
+                if (req_is_v2)
+                    write(format_v2_response('NOTFOUND'));
+                else
+                    write('NOTFOUND\n');
                 return;
             }
         }

@@ -51,7 +51,10 @@ SMARTDCLIBDIR =	$(DESTDIR)/smartdc/lib
 #
 bootparams :	LIBS +=		-ldevinfo
 bootparams :	WARN_FLAGS +=	-Wno-unused
-diskinfo :	LIBS +=		-ldladm -ldiskmgt -lnvpair
+diskinfo :	LDFLAGS +=	-L$(DESTDIR)/usr/lib/fm
+diskinfo :	CPPFLAGS +=	-I$(ROOT)/projects/illumos/usr/src/lib/fm/topo
+diskinfo :	LIBS +=		-R/usr/lib/fm
+diskinfo :	LIBS +=		-ldladm -ldiskmgt -lnvpair -ltopo
 zfs_recv :	LIBS +=		-lsocket
 zfs_send :	LIBS +=		-lsocket
 vmbundle :	CPPFLAGS +=	-D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64
@@ -60,21 +63,41 @@ zoneevent :	LIBS +=		-lnvpair -lsysevent
 
 # These files will get run through jsstyle and jslint on 'make check'
 JS_CHECK_TARGETS=\
-  filewait.js \
-	node_modules/{system,onlyif}.js \
+	filewait.js \
+	node_modules/{system,onlyif,net-boot-config}.js \
+	net-boot-config \
 	vm/sbin/*.js \
-	vm/node_modules/{qmp,VM,dladm}.js \
+	vm/node_modules/{dladm,expander,proptable,utils,VM,qmp,openonerrlogger}.js \
+	vm/node_modules/vmload/*.js \
 	img/lib/*.js \
 	img/sbin/imgadm \
+	vm/common/nictag.js \
+	vm/tests/test-alias.js \
+	vm/tests/test-cleanup-on-failure.js \
+	vm/tests/test-create.js \
+	vm/tests/test-create-filesystems.js \
+	vm/tests/test-docker.js \
+	vm/tests/test-defaults.js \
+	vm/tests/test-indestructible.js \
+	vm/tests/test-internal_metadata_namespaces.js \
+	vm/tests/test-lastexited.js \
+	vm/tests/test-openonerrlogger.js \
+	vm/tests/test-reboot.js \
+	vm/tests/test-spoof-opts.js \
+	vm/tests/test-tmpfs.js \
+	vm/tests/test-update.js \
+	vm/tests/test-vrrp-nics.js \
 	vm/lib/metadata/*.js
 
 JS_CHECK_OLDSKOOL_TARGETS = \
 	disklayout.js \
 	mkzpool.js \
+	ntp_config.js \
 	node_modules/disklayout.js
 
 # These files will get run through cstyle on 'make check'
 C_CHECK_TARGETS=\
+	cryptpass.c \
 	qemu-exec.c \
 	vmunbundle.c \
 	zfs_recv.c \
@@ -116,14 +139,24 @@ $(KSTAT.NODE) :	LDFLAGS +=	$(NODE_LDFLAGS)
 $(KSTAT.NODE) :	LIBS +=		-lkstat
 
 #
+# The lockfd Node add-on is based on v8plus, which has its own system of
+# Makefiles.
+#
+LOCKFD_BINDING.NODE =		node-lockfd/lib/lockfd_binding.node
+
+LOCKFD_SRC_DIR =		node-lockfd/src
+LOCKFD_V8PLUS_DIR =		node-lockfd/node_modules/v8plus
+
+#
 # The dtrace-provider add-on uses a combination of C, assembly and C++ files in
 # multiple directories.
 #
 DTRACE_PROVIDER_OBJDIR =	node-dtrace-provider/build/Release
 DTRACE_PROVIDER_SRCDIR =	node-dtrace-provider
-DTRACE_PROVIDER.NODE =		$(DTRACE_PROVIDER_OBJDIR)/dtrace-provider.node
+DTRACE_PROVIDER.NODE =		$(DTRACE_PROVIDER_OBJDIR)/DTraceProviderBindings.node
 
 DTRACE_PROVIDER_SRCS += \
+			dtrace_argument.cc \
 			dtrace_probe.cc \
 			dtrace_provider.cc
 
@@ -156,6 +189,18 @@ $(DTRACE_PROVIDER.NODE) :	CXXFLAGS +=	$(NODE_CFLAGS)
 $(DTRACE_PROVIDER.NODE) :	LDFLAGS +=	$(NODE_LDFLAGS)
 
 CLEANFILES +=	$(DTRACE_PROVIDER.NODE) $(DTRACE_PROVIDER_OBJS)
+
+#
+# The microtime Node add-on follows the same pattern as EXPAT.NODE.
+#
+MICROTIME_OBJDIR =	node-microtime/build/Release
+MICROTIME.NODE =	$(MICROTIME_OBJDIR)/microtime.node
+
+$(MICROTIME.NODE) :	WARN_FLAGS +=	-Wno-unused -Wno-write-strings -Wno-sign-compare
+$(MICROTIME.NODE) :	CPPFLAGS +=	$(NODE_CPPFLAGS)
+$(MICROTIME.NODE) :	CXXFLAGS +=	$(NODE_CFLAGS)
+$(MICROTIME.NODE) :	LDFLAGS +=	$(NODE_LDFLAGS)
+
 
 #
 # The sqlite3 add-on uses a combination of C + C++ files in multiple
@@ -219,67 +264,32 @@ $(SQLITE3_BINDINGS.NODE) :	LDFLAGS += \
 $(SQLITE3_BINDINGS.NODE) :	LIBS += -lpthread
 
 #
-# The zsock add-on places its single source file in a subdirectory.
+# The libuuid Node add-on follows the same pattern as EXPAT.NODE.
 #
-ZSOCK_OBJDIR =	node-zsock/build/Release
-ZSOCK_SRCDIR =	node-zsock/src
-ZSOCK_BINDINGS.NODE =	$(ZSOCK_OBJDIR)/zsock_bindings.node
+UUID_OBJDIR =	node-libuuid/build/Release
+UUID_SRCDIR =	node-libuuid/src
+UUID.NODE =	$(UUID_OBJDIR)/uuid.node
 
-$(ZSOCK_BINDINGS.NODE) :	WARN_FLAGS =	-Wall -Werror
-$(ZSOCK_BINDINGS.NODE) :	CPPFLAGS += \
-				$(NODE_CPPFLAGS) \
-				-D_REENTRANT \
-				-D_POSIX_PTHREAD_SEMANTICS \
-				-D_XOPEN_SOURCE_EXTENDED=1 \
-				-D__EXTENSIONS__ \
-				-DSunOS
-$(ZSOCK_BINDINGS.NODE) :	CXXFLAGS += \
-				$(NODE_CFLAGS) \
-				-std=c++98
-$(ZSOCK_BINDINGS.NODE) :	LDFLAGS +=	$(NODE_LDFLAGS)
-$(ZSOCK_BINDINGS.NODE) :	LIBS +=		-lsocket -lnsl -lcontract
+$(UUID.NODE) :	WARN_FLAGS +=	-Wno-unused -Wno-write-strings -Wno-sign-compare
+$(UUID.NODE) :	CPPFLAGS +=	$(NODE_CPPFLAGS)
+$(UUID.NODE) :	CXXFLAGS +=	$(NODE_CFLAGS)
+$(UUID.NODE) :	LDFLAGS +=	$(NODE_LDFLAGS)
+$(UUID.NODE) :	LIBS +=		-luuid
 
 #
-# The zutil add-on places its multiple source files in a subdirectory, and
-# builds them against some headers that it also supplies and needs to depend on.
-# Because we must build intermediate object files, this requires a
-# different target pattern as well; see below.
+# The zsock Node add-on is based on v8plus, which has its own system of
+# Makefiles.
 #
-ZUTIL_OBJDIR =	node-zutil/build/Release
-ZUTIL_SRCDIR =	node-zutil/src
-ZUTIL_BINDINGS.NODE =	$(ZUTIL_OBJDIR)/zutil_bindings.node
-
-ZUTIL_SRCS += \
-	zone.cc \
-	zonecfg.cc \
-	zutil_bindings.cc
-
-ZUTIL_HDRS += \
-	zone.h \
-	zonecfg.h \
-	zutil_common.h
-
-ZUTIL_BINDINGS_OBJS =	$(ZUTIL_SRCS:%.cc=$(ZUTIL_OBJDIR)/%.o)
-ZUTIL_BINDINGS_HDRS =	$(ZUTIL_HDRS:%=$(ZUTIL_SRCDIR)/%)
-CLEANFILES +=		$(ZUTIL_BINDINGS_OBJS)
-
-$(ZUTIL_BINDINGS.NODE) :	WARN_FLAGS +=	-Wno-unused
-$(ZUTIL_BINDINGS.NODE) :	CPPFLAGS +=	$(NODE_CPPFLAGS) -DSunOS
-$(ZUTIL_BINDINGS.NODE) :	CXXFLAGS +=	$(NODE_CFLAGS)
-$(ZUTIL_BINDINGS.NODE) :	LDFLAGS +=	$(NODE_LDFLAGS)
-$(ZUTIL_BINDINGS.NODE) :	LIBS +=		-lzonecfg
+ZSOCK_SRCDIR =		node-zsock/src
+ZSOCK_V8PLUS_DIR =	node-zsock/node_modules/v8plus
+ZSOCK_BINDINGS.NODE =	$(ZSOCK_SRCDIR)/../lib/zsock_bindings.node
 
 #
-# thomas@freeagent:
-# NodeJS module for zookeeper
+# Likewise zutil.
 #
-ZOOKEEPER_OBJDIR = node-zookeeper/build/Release
-ZOOKEEPER.NODE = $(ZOOKEEPER_OBJDIR)/zookeeper_native.node
-$(ZOOKEEPER.NODE) :	WARN_FLAGS +=	-Wno-unused
-$(ZOOKEEPER.NODE) :	CPPFLAGS +=	$(NODE_CPPFLAGS) -I$(DESTDIR)/usr/include/zookeeper
-$(ZOOKEEPER.NODE) :	CXXFLAGS +=	$(NODE_CFLAGS) -I$(DESTDIR)/usr/include/zookeeper
-$(ZOOKEEPER.NODE) :	LDFLAGS +=	$(NODE_LDFLAGS) -L$(DESTDIR)/usr/lib
-$(ZOOKEEPER.NODE) :	LIBS +=		-lzookeeper_st
+ZUTIL_SRCDIR =		node-zutil/src
+ZUTIL_V8PLUS_DIR =	node-zutil/node_modules/v8plus
+ZUTIL_BINDINGS.NODE =	$(ZUTIL_SRCDIR)/../lib/zutil_bindings.node
 
 #
 # List of targets.  TARGETS, SMARTDC_TARGETS, and SMARTDC_LIB_TARGETS must
@@ -288,6 +298,8 @@ $(ZOOKEEPER.NODE) :	LIBS +=		-lzookeeper_st
 #
 TARGETS = \
 	bootparams \
+	dockerinit/build/dockerexec \
+	dockerinit/build/dockerinit \
 	diskinfo \
 	disklayout \
 	disklist \
@@ -298,22 +310,27 @@ TARGETS = \
 	zfs_recv \
 	zfs_send \
 	zoneevent \
+	vm/node_modules/props.js \
 	$(EXPAT.NODE) \
 	$(DTRACE_PROVIDER.NODE) \
 	$(KSTAT.NODE) \
+	$(LOCKFD_BINDING.NODE) \
+	$(MICROTIME.NODE) \
 	$(SYSLOG.NODE) \
 	$(SQLITE3_BINDINGS.NODE) \
+	$(UUID.NODE) \
 	$(ZSOCK_BINDINGS.NODE) \
-	$(ZUTIL_BINDINGS.NODE) \
-	$(ZOOKEEPER.NODE)
+	$(ZUTIL_BINDINGS.NODE)
 
 USR_LIB_TARGETS = \
+	cryptpass \
 	measure_terminal
 
 SMARTDC_TARGETS = \
 	qemu-exec
 
 SMARTDC_LIB_TARGETS = \
+	ntp_config \
 	sdc-on-tty
 
 all: $(TARGETS) $(USR_LIB_TARGETS) sysinfo nictagadm $(SMARTDC_TARGETS) \
@@ -330,15 +347,18 @@ install: all
 	mkdir -m 0755 -p $(PREFIX_NODE)/node_modules
 	cp -Pr node_modules/* $(PREFIX_NODE)/node_modules
 	cp $(KSTAT.NODE) $(PREFIX_NODE)/node_modules/
-	cp $(ZOOKEEPER.NODE) $(PREFIX_NODE)/node_modules/zookeeper_native.node
+	cp node-lockfd/lib/index.js $(PREFIX_NODE)/node_modules/lockfd.js
+	cp $(LOCKFD_BINDING.NODE) $(PREFIX_NODE)/node_modules/lockfd_binding.node
+	cp $(MICROTIME.NODE) $(PREFIX_NODE)/node_modules/
 	rm -rf $(DESTDIR)/usr/vm
 	cp -PR vm $(DESTDIR)/usr/
 	mkdir -m 0755 -p $(DESTDIR)/usr/vm/node_modules
 	mkdir -p $(PREFIX_NODE)/node_modules/{zsock,zutil}/build/Release
 	mkdir -p $(DESTDIR)/usr/vm/test/tests
 	cp -Pr vm/common $(DESTDIR)/usr/vm/test/
-	cp -Pr vm/node-tap $(DESTDIR)/usr/vm/test/
-	cp -Pr vm/tests $(DESTDIR)/usr/vm/test/
+	mkdir -p $(DESTDIR)/usr/vm/test/tests
+	cp -Pr vm/tests/*.js $(DESTDIR)/usr/vm/test/tests/
+	cp -Pr vm/tests/testdata $(DESTDIR)/usr/vm/test/
 	cp vm/runtest $(DESTDIR)/usr/vm/test/
 	cp vm/runtests $(DESTDIR)/usr/vm/test/
 	cp -Pr node-zsock/{package.json,lib} \
@@ -357,13 +377,14 @@ install: all
 	cp $(ZUTIL_BINDINGS.NODE) \
 	    $(PREFIX_NODE)/node_modules/zutil/build/Release
 	cp $(EXPAT.NODE) $(PREFIX_NODE)/node_modules/expat_binding.node
-	cp $(DTRACE_PROVIDER.NODE) $(PREFIX_NODE)/node_modules/dtrace-provider.node
-	sed -e "s|require('./build.*DTraceProviderBindings')|require('/usr/node/node_modules/dtrace-provider.node')|" \
-	    < $(DTRACE_PROVIDER_SRCDIR)/dtrace-provider.js \
-	    > $(PREFIX_NODE)/node_modules/dtrace-provider.js
+	cp $(UUID.NODE) $(PREFIX_NODE)/node_modules/uuid.node
+	cp $(DTRACE_PROVIDER.NODE) $(PREFIX_NODE)/node_modules/DTraceProviderBindings.node
+	cp node-dtrace-provider/dtrace-provider.js $(PREFIX_NODE)/node_modules/dtrace-provider.js
 	sed -e "s|var expat.*;|var expat = require('./expat_binding');|" \
 	    < node-expat/lib/node-expat.js \
 	    > $(PREFIX_NODE)/node_modules/node-expat.js
+	cp dockerinit/build/dockerinit $(DESTDIR)/usr/vm/sbin/dockerinit
+	cp dockerinit/build/dockerexec $(DESTDIR)/usr/vm/sbin/dockerexec
 	cp zoneevent $(DESTDIR)/usr/vm/sbin/zoneevent
 	cp zfs_send $(DESTDIR)/usr/vm/sbin/zfs_send
 	cp zfs_recv $(DESTDIR)/usr/vm/sbin/zfs_recv
@@ -380,7 +401,7 @@ install: all
 	    $(DESTDIR)/usr/vm/sbin/add-userscript
 	mv $(DESTDIR)/usr/vm/sbin/metadata.js $(DESTDIR)/usr/vm/sbin/metadata
 	mkdir -p $(DESTDIR)/usr/share/man/man1
-	sed -e "s|require('dtrace-provider')|require('/usr/node/node_modules/dtrace-provider')|" \
+	sed -e "s|require('dtrace-provider'|require('/usr/node/node_modules/dtrace-provider'|" \
 	    < node-bunyan/lib/bunyan.js \
 	    > $(PREFIX_NODE)/node_modules/bunyan.js
 	cp node-bunyan/docs/bunyan.1 $(DESTDIR)/usr/share/man/man1/bunyan.1
@@ -388,8 +409,6 @@ install: all
 	sed -e 's|^#!/usr/bin/env node.*$$|#!/usr/node/bin/node|' \
 	    < node-bunyan/bin/bunyan \
 	    > $(DESTDIR)/usr/bin/bunyan
-	cp node-panic/lib/panic.js $(PREFIX_NODE)/node_modules/panic.js
-	cp node-panic/lib/subr.js $(PREFIX_NODE)/node_modules/subr.js
 	rm -rf $(DESTDIR)/usr/img
 	mkdir -m 0755 -p $(DESTDIR)/usr/img
 	cp img/README.md $(DESTDIR)/usr/img/README.md
@@ -401,11 +420,24 @@ install: all
 	cp -PR img/sbin $(DESTDIR)/usr/img/
 	cp -PR img/test $(DESTDIR)/usr/img/
 	rm -rf $(DESTDIR)/usr/fw
-	mkdir -m 0755 -p $(DESTDIR)/usr/fw
+	mkdir -m 0755 -p $(DESTDIR)/usr/fw/test
 	cp -PR fw/etc $(DESTDIR)/usr/fw/
+	cp -Pr fw/test/integration $(DESTDIR)/usr/fw/test/
+	cp -Pr fw/test/lib $(DESTDIR)/usr/fw/test/
+	cp -Pr fw/test/node_modules $(DESTDIR)/usr/fw/test/
+	cp fw/test/runtest $(DESTDIR)/usr/fw/test/
+	cp fw/test/runtests $(DESTDIR)/usr/fw/test/
 	cp -PR fw/lib $(DESTDIR)/usr/fw/
 	cp -PR fw/node_modules $(DESTDIR)/usr/fw/
 	cp -PR fw/sbin $(DESTDIR)/usr/fw/
+	cp -Pr node_modules/onlyif.js $(DESTDIR)/usr/fw/node_modules/onlyif.js
+	cp $(DESTDIR)/usr/node/0.10/node_modules/dtrace-provider.js $(DESTDIR)/usr/fw/node_modules/dtrace-provider.js
+	cp $(DTRACE_PROVIDER.NODE) $(DESTDIR)/usr/fw/node_modules/DTraceProviderBindings.node
+	sed -e "s|require('dtrace-provider')|require('/usr/fw/node_modules/dtrace-provider')|" \
+	    < node-bunyan/lib/bunyan.js \
+	    > $(DESTDIR)/usr/fw/node_modules/bunyan.js
+	mkdir -m 0755 -p $(DESTDIR)/usr/lib/sdc
+	cp -p net-boot-config $(DESTDIR)/usr/lib/sdc
 
 check: $(JSLINT)
 	@echo "==> Running cstyle..."
@@ -414,6 +446,7 @@ check: $(JSLINT)
 		echo $(PWD)/$$file; \
 		$(CSTYLE) $$file; \
 	done)
+	@(cd $(PWD)/dockerinit && $(MAKE) check)
 	@printf "\nC files ok!\n"
 	@printf "\n==> Running JavaScriptLint...\n"
 	@$(JSLINT) --nologo --conf=$(ROOT)/tools/jsl.node.conf \
@@ -436,9 +469,21 @@ check: $(JSLINT)
 manifest:
 	(cat manifest && cd vm && \
 	    echo "# list of tests is autogenerated by smartos-live/src/Makefile" && \
-	    find tests/ -type f -exec echo "{}" "0444 root bin" \;) \
+	    (find tests/ -type f -exec echo "{}" "0444 root bin" \; | grep -v "/testdata/")) \
 	    | sed -e "s|^tests/|f usr/vm/test/tests/|" \
-	    > $(DESTDIR)/$(DESTNAME) \
+	    > $(DESTDIR)/$(DESTNAME)
+	(cd vm/tests && \
+	    find testdata/ -type f -exec echo "{}" "0444 root bin" \;) \
+	    | sed -e "s|^testdata/|f usr/vm/test/testdata/|" \
+	    >> $(DESTDIR)/$(DESTNAME)
+	(cd fw/test && \
+	    find integration/ -type f -exec echo "{}" "0444 root bin" \;) \
+	    | sed -e "s|^integration/|f usr/fw/test/integration/|" \
+	    >> $(DESTDIR)/$(DESTNAME)
+	(cd fw/etc && \
+	    find examples/ -type f -exec echo "{}" "0444 root bin" \;) \
+	    | sed -e "s|^examples/|f usr/fw/etc/examples/|" \
+	    >> $(DESTDIR)/$(DESTNAME)
 
 $(JSLINT):
 	(cd $(ROOT); $(MAKE) jsl)
@@ -447,6 +492,8 @@ clean:
 	-rm -f $(TARGETS) $(SMARTDC_TARGETS) $(SMARTDC_LIB_TARGETS) *.o \
 	    $(CLEANFILES)
 	-rm -rf node-sqlite3/build
+	@(cd dockerinit && $(MAKE) clean)
+	cd $(LOCKFD_SRC_DIR) && $(MAKE) clean
 
 include Makefile.targ
 
@@ -462,15 +509,31 @@ disklist: disklist.sh
 	cp disklist.sh disklist
 	chmod 0755 disklist
 
+dockerinit/build/dockerexec: dockerinit/src/dockerexec.c \
+	    dockerinit/src/docker-common.c
+	@(cd dockerinit && $(MAKE) build/dockerexec)
+
+dockerinit/build/dockerinit: dockerinit/src/dockerinit.c \
+	    dockerinit/src/docker-common.c
+	@(cd dockerinit && $(MAKE) build/dockerinit)
+
 mkzpool: mkzpool.js
 	cp mkzpool.js mkzpool
 	chmod 0755 mkzpool
+
+ntp_config: ntp_config.js
+	cp $^ $@
+	chmod 0755 $@
 
 sysinfo:
 	touch sysinfo
 
 nictagadm:
 	touch nictagadm
+
+vm/node_modules/props.js: vm/node_modules/proptable.js vm/node_modules/expander.js
+	node vm/node_modules/expander.js > vm/node_modules/props.js.new \
+		&& mv vm/node_modules/props.js.new vm/node_modules/props.js
 
 #
 # Node native add-on target patterns.  Follow these patterns when adding a new
@@ -479,6 +542,23 @@ nictagadm:
 $(EXPAT.NODE): node-expat/node-expat.cc
 	@mkdir -p $(EXPAT_OBJDIR)
 	$(GXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
+
+#
+# node-lockfd is built using the v8plus-based Makefile contained within the
+# project.  We use LD_OPTIONS, here, to induce the linker to include libc,
+# which gcc as configured in proto.strap does not, but which other C compilers
+# generally do.
+#
+$(LOCKFD_BINDING.NODE): FRC
+	cd $(LOCKFD_SRC_DIR) && \
+	LD_OPTIONS=-lc \
+	$(MAKE) \
+		CC=$(GCC) CXX=$(GXX) \
+		PREFIX_NODE=$(PREFIX_NODE) \
+		NODE_EXEC=$(NODE_EXEC) \
+		V8PLUS=$(PWD)/$(LOCKFD_V8PLUS_DIR) \
+		CTFCONVERT=$(CTFCONVERT) \
+		CTFMERGE=$(CTFMERGE)
 
 #
 # The next two are used to build libusdt files into
@@ -506,15 +586,8 @@ $(KSTAT.NODE): node-kstat/kstat.cc
 	@mkdir -p $(KSTAT_OBJDIR)
 	$(GXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
 
-# <hack alert> Build the zookeeper c-library!
-$(ZOOKEEPER_OBJDIR)/zk/lib/libzookeeper_st.a:
-	@mkdir -p $(ZOOKEEPER_OBJDIR)/zk
-	(cd node-zookeeper/zk_c && \
-		CFLAGS='-pthread -D_POSIX_PTHREAD_SEMANTICS' LDFLAGS='-lnsl -lsocket' ./configure --without-syncapi --without-shared --disable-shared --with-pic --prefix=/usr && \
-		make clean install )
-	
-$(ZOOKEEPER.NODE): node-zookeeper/src/node-zk.cpp $(ZOOKEEPER_OBJDIR)/zk/lib/libzookeeper_st.a
-	@mkdir -p $(ZOOKEEPER_OBJDIR)
+$(MICROTIME.NODE): node-microtime/src/microtime.cc
+	@mkdir -p $(MICROTIME_OBJDIR)
 	$(GXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
 
 $(SQLITE3_OBJDIR)/%.o: $(SQLITE3_SRCDIR)/%.cc $(SQLITE3_HDRS)
@@ -528,16 +601,30 @@ $(SQLITE3_OBJDIR)/%.o: $(SQLITE3_LIBSRCDIR)/%.c $(SQLITE3_HDRS)
 $(SQLITE3_BINDINGS.NODE): $(SQLITE3_OBJS)
 	$(GXX) $(LDFLAGS) -o $@ $(SQLITE3_OBJS) $(LIBS)
 
-$(ZSOCK_BINDINGS.NODE): $(ZSOCK_SRCDIR)/zsock.cc
-	@mkdir -p $(ZSOCK_OBJDIR)
+$(UUID.NODE): $(UUID_SRCDIR)/uuid.cc
+	@mkdir -p $(UUID_OBJDIR)
 	$(GXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
 
-#
-# The zutil add-on requires a slightly more complex 2-phase build.
-#
-$(ZUTIL_OBJDIR)/%.o: $(ZUTIL_SRCDIR)/%.cc $(ZUTIL_BINDINGS_HDRS)
-	@mkdir -p $(ZUTIL_OBJDIR)
-	$(GXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ -c $<
+$(ZSOCK_BINDINGS.NODE): FRC
+	cd $(ZSOCK_SRCDIR) && \
+	LD_OPTIONS=-lc \
+	$(MAKE) \
+		CC=$(GCC) CXX=$(GXX) \
+		PREFIX_NODE=$(PREFIX_NODE) \
+		NODE_EXEC=$(NODE_EXEC) \
+		V8PLUS=$(PWD)/$(ZSOCK_V8PLUS_DIR) \
+		CTFCONVERT=$(CTFCONVERT) \
+		CTFMERGE=$(CTFMERGE)
 
-$(ZUTIL_BINDINGS.NODE): $(ZUTIL_BINDINGS_OBJS)
-	$(GXX) $(LDFLAGS) -o $@ $(ZUTIL_BINDINGS_OBJS) $(LIBS)
+$(ZUTIL_BINDINGS.NODE): FRC
+	cd $(ZUTIL_SRCDIR) && \
+	LD_OPTIONS=-lc \
+	$(MAKE) \
+		CC=$(GCC) CXX=$(GXX) \
+		PREFIX_NODE=$(PREFIX_NODE) \
+		NODE_EXEC=$(NODE_EXEC) \
+		V8PLUS=$(PWD)/$(ZUTIL_V8PLUS_DIR) \
+		CTFCONVERT=$(CTFCONVERT) \
+		CTFMERGE=$(CTFMERGE)
+
+FRC:
