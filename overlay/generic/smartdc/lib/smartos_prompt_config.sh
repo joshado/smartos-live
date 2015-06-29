@@ -507,6 +507,16 @@ printheader()
 
 }
 
+#
+# Look for a custom configuration script in the bootfs environment.
+# If it exists, exec off into that script now, so it can share all the
+# lovely stock functions that have just been defined.
+#
+if [ -e /system/boot/config_script  ]; then
+  echo "Bootloader shipped a custom configuration script, loading it."
+  . /system/boot/config_script
+fi
+
 trap sigexit SIGINT
 
 #
